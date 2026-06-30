@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "natoolkit"
+version = "0.1.0"
+description = "Lab tools for neural activity data analysis."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "napari",
+    "numpy",
+    "qtpy",
+    "scipy",
+]
+
+[project.scripts]
+activity-tracer = "natoolkit.tools.activity_tracer.activity_tracer:main"
+
+[project.entry-points."napari.manifest"]
+natoolkit = "natoolkit:napari.yaml"
+
+[tool.setuptools.packages.find]
+include = ["natoolkit*"]
+
+[tool.setuptools.package-data]
+natoolkit = ["napari.yaml"]
