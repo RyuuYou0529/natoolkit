@@ -8,6 +8,14 @@ Lab-internal tools for neural activity data analysis.
 
 ## Install
 
+Install from GitHub:
+
+```bash
+pip install "git+https://github.com/RyuuYou0529/natoolkit.git"
+```
+
+Install from a local checkout:
+
 ```bash
 pip install -e .
 ```
