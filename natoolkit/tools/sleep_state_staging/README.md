@@ -9,11 +9,11 @@ NREM
 REM
 ```
 
-The method is based on the reusable EEG/EMG staging logic in
-`test/ref/from_JinXuan/CNO_Spectral_Temperature_Analysis.py`, but it removes the
-CNO and temperature-specific parts. This tool is intended to produce a
-reproducible hypnogram that can later be aligned to two-photon movie frames and
-VideoSD outputs.
+The method follows the v3.2 JinXuan sleep-staging reference in
+`test/ref/from_JinXuan/Sleep_Stage_Analysis_v3_2.py`, keeping the reusable
+EEG/EMG classifier while leaving out the reference script's interactive plotting
+and external-label import modes. This tool produces a reproducible hypnogram
+that can later be aligned to two-photon movie frames and VideoSD outputs.
 
 ## Recommended Workflow
 
@@ -59,6 +59,31 @@ sleep_state_summary.json
 sleep_state_hypnogram.pdf
 ```
 
+### Correction GUI
+
+Launch the minimal review GUI with:
+
+```bash
+python -m natoolkit.tools.sleep_state_staging.gui
+```
+
+The GUI runs the same staging backend, displays EEG, EMG, and Auto/Final
+hypnogram rows, and lets users correct selected epoch intervals. Select an
+interval on the hypnogram, then press `1`, `2`, or `3`:
+
+```text
+1 -> Wake
+2 -> NREM
+3 -> REM
+```
+
+Corrected labels are saved to:
+
+```text
+sleep_state_corrected_epochs.csv
+sleep_state_corrected_summary.json
+```
+
 ### Python API
 
 ```python
@@ -84,7 +109,8 @@ plot_hypnogram(eeg, emg, result, recording.fs, "hypnogram.pdf")
 ```
 
 `result.labels` contains one label per 1 s step. `result.times_sec` contains the
-center time of each 5 s staging window.
+center time of each 1 s output label interval. Each label is still inferred from
+a 5 s feature window.
 
 ## Core Method
 
@@ -93,13 +119,16 @@ The classifier uses:
 - 5 s rolling windows.
 - 1 s step size.
 - EEG downsampled to 100 Hz for spectral features.
-- EMG RMS, EMG P90, and EMG coefficient of variation.
-- EEG delta power, theta power, and 20-40 Hz high-frequency power.
+- EMG RMS, EMG P90, coefficient of variation, and 50-150 Hz mid-band power.
+- EEG delta power, theta power, sigma, beta, gamma, total power, spectral
+  entropy, and 20-40 Hz high-frequency power.
 - Adaptive Wake/Sleep scoring based on EMG dynamic range.
 - Otsu thresholds for Wake/Sleep and REM/NREM separation.
-- Theta/delta ratio for REM versus NREM.
+- v3.2 theta/delta ratio for REM versus NREM: theta `6-10 Hz`, delta
+  `0.5-4 Hz`.
 - Post-processing rules for impossible Wake-to-REM transitions, short bouts,
-  sleep onset, microarousals, and sustained EMG Wake overrides.
+  REM-after-NREM validation, sleep onset, microarousals, and sustained EMG Wake
+  overrides.
 
 `--wake-mode auto` follows the reference script's adaptive rule:
 
@@ -110,8 +139,8 @@ dynamic range < 2x   -> eeg_primary
 ```
 
 The explicit modes `emg_primary`, `balanced`, and `eeg_primary` are also
-available for diagnostic comparisons. The CNO-specific transfer mode from the
-reference script is intentionally not included.
+available for diagnostic comparisons. The CNO-specific transfer mode and
+AccuSleePy import mode from the reference script are intentionally not included.
 
 The default stages are stored as exact strings:
 
@@ -189,8 +218,8 @@ Before using labels for calcium activity analysis, check:
 - EMG is high during Wake and low during sleep.
 - REM bouts are preceded by NREM.
 - Manual notes agree with automatic labels around recorded movie intervals.
-- The time convention is consistent: labels are represented by window-center
-  times in `result.times_sec`.
+- The time convention is consistent: labels are represented by 1 s interval
+  centers in `result.times_sec`.
 
 ## Current Scope
 

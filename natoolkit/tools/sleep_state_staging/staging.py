@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import resample, welch
+from scipy.signal import butter, filtfilt, resample, welch
 
 
 WAKE = "Wake"
@@ -12,7 +12,7 @@ NREM = "NREM"
 REM = "REM"
 STAGES = (WAKE, NREM, REM)
 WAKE_MODES = ("auto", "emg_primary", "balanced", "eeg_primary")
-EPS = 1e-15
+EPS = 1e-12
 
 
 @dataclass(frozen=True)
@@ -21,10 +21,18 @@ class StagingParams:
     epoch_sec: float = 5.0
     step_sec: float = 1.0
     target_eeg_fs: float = 100.0
-    delta_band: tuple[float, float] = (1.0, 4.0)
-    theta_band: tuple[float, float] = (6.0, 8.0)
+    delta_band: tuple[float, float] = (0.5, 4.0)
+    theta_band: tuple[float, float] = (6.0, 10.0)
+    sigma_band: tuple[float, float] = (10.0, 15.0)
+    beta_band: tuple[float, float] = (15.0, 30.0)
+    gamma_band: tuple[float, float] = (30.0, 50.0)
+    eeg_total_band: tuple[float, float] = (0.5, 50.0)
     high_frequency_band: tuple[float, float] = (20.0, 40.0)
+    emg_low_band: tuple[float, float] = (10.0, 50.0)
+    emg_mid_band: tuple[float, float] = (50.0, 150.0)
+    emg_high_band: tuple[float, float] = (150.0, 300.0)
     emg_clip_percentile: float = 99.0
+    emg_mid_weight: float = 0.35
     normalize_low_percentile: float = 2.0
     normalize_high_percentile: float = 98.0
     strong_emg_dynamic_range: float = 5.0
@@ -73,33 +81,25 @@ def classify_sleep_state(
     params = params or StagingParams()
     if params.wake_mode not in WAKE_MODES:
         raise ValueError(f"wake_mode must be one of {WAKE_MODES}, got {params.wake_mode!r}")
+
     eeg = np.asarray(eeg, dtype=np.float64)
     emg = np.asarray(emg, dtype=np.float64)
-    n = min(len(eeg), len(emg))
-    eeg = eeg[:n]
-    emg = emg[:n]
+    n_samples = min(len(eeg), len(emg))
+    eeg = eeg[:n_samples]
+    emg = emg[:n_samples]
 
     eeg_ds, fs_ds = _downsample_eeg(eeg, fs, params.target_eeg_fs)
-    win_eeg = int(round(params.epoch_sec * fs_ds))
-    win_emg = int(round(params.epoch_sec * fs))
-    step_eeg = int(round(params.step_sec * fs_ds))
-    step_emg = int(round(params.step_sec * fs))
-    n_steps = min(
-        (len(eeg_ds) - win_eeg) // step_eeg + 1,
-        (len(emg) - win_emg) // step_emg + 1,
-    )
-    n_steps = max(int(n_steps), 0)
-    if n_steps == 0:
+    windows = _window_sizes(fs, fs_ds, len(emg), len(eeg_ds), params)
+    if windows["n_steps"] == 0:
         return _empty_result(params)
 
     clip_thr = float(np.percentile(np.abs(emg), params.emg_clip_percentile))
-    emg_c = np.clip(emg, -clip_thr, clip_thr)
-    features = _extract_features(eeg_ds, emg_c, fs_ds, fs, n_steps, win_eeg, win_emg, step_eeg, step_emg, params)
+    emg_clipped = np.clip(emg, -clip_thr, clip_thr)
+    features = _extract_features(eeg_ds, emg_clipped, fs_ds, fs, windows, params)
 
-    emg_feat_raw = (features["emg_rms"] * features["emg_p90"] * features["emg_cv"]) ** (1.0 / 3.0)
-    emg_feat = emg_feat_raw / (np.max(emg_feat_raw) + EPS)
+    emg_activity = _emg_activity(features, params)
     td_ratio = features["theta"] / (features["delta"] + EPS)
-    emg_norm = _percentile_normalize(emg_feat, params)
+    emg_norm = _percentile_normalize(emg_activity, params)
     td_norm = _percentile_normalize(td_ratio, params)
     hf_norm = _percentile_normalize(features["eeg_hf"], params)
     delta_norm = _percentile_normalize(features["delta"], params)
@@ -112,6 +112,7 @@ def classify_sleep_state(
     wake_score_norm = _percentile_normalize(wake_score, params)
     wake_thr = _otsu_threshold(wake_score_norm)
     wake_mask = wake_score_norm >= wake_thr
+
     if float(np.mean(wake_mask)) > params.max_initial_wake_fraction:
         mode = "eeg_primary"
         wake_score = 0.15 * emg_norm + 0.55 * hf_norm + 0.30 * (1.0 - delta_norm)
@@ -125,14 +126,23 @@ def classify_sleep_state(
 
     td_thr = _sleep_td_threshold(td_norm, wake_mask, params)
     labels = np.where(wake_mask, WAKE, np.where(td_norm >= td_thr, REM, NREM)).astype(object)
-    labels = _postprocess_labels(labels, features["emg_p90"], noise_floor, wake_score_norm, td_norm, wake_thr, td_thr, params)
+    labels = _postprocess_labels(
+        labels,
+        features["emg_p90"],
+        noise_floor,
+        wake_score_norm,
+        td_norm,
+        wake_thr,
+        td_thr,
+        params,
+    )
 
     features.update(
         {
-            "emg_feature": emg_feat,
+            "emg_activity": emg_activity,
             "emg_norm": emg_norm,
-            "td_ratio": td_ratio,
-            "td_norm": td_norm,
+            "theta_delta_ratio": td_ratio,
+            "theta_delta_norm": td_norm,
             "eeg_hf_norm": hf_norm,
             "delta_norm": delta_norm,
             "wake_score": wake_score_norm,
@@ -144,7 +154,10 @@ def classify_sleep_state(
         "theta_delta": float(td_thr),
         "emg_noise_floor": noise_floor,
     }
-    times_sec = np.arange(n_steps, dtype=np.float64) * params.step_sec + params.epoch_sec / 2.0
+    times_sec = (
+        np.arange(windows["n_steps"], dtype=np.float64) * params.step_sec
+        + params.step_sec / 2.0
+    )
     summary = _summary(labels, dynamic_range, mode)
     return StagingResult(labels=labels, times_sec=times_sec, features=features, thresholds=thresholds, summary=summary, params=params)
 
@@ -156,46 +169,160 @@ def _downsample_eeg(eeg: np.ndarray, fs: float, target_fs: float) -> tuple[np.nd
     return resample(eeg, n_samples), target_fs
 
 
+def _window_sizes(
+    fs_emg: float,
+    fs_eeg: float,
+    n_emg: int,
+    n_eeg: int,
+    params: StagingParams,
+) -> dict[str, int]:
+    win_eeg = int(round(params.epoch_sec * fs_eeg))
+    win_emg = int(round(params.epoch_sec * fs_emg))
+    step_eeg = int(round(params.step_sec * fs_eeg))
+    step_emg = int(round(params.step_sec * fs_emg))
+    if min(win_eeg, win_emg, step_eeg, step_emg) <= 0:
+        return {"n_steps": 0}
+    n_steps = min((n_eeg - win_eeg) // step_eeg + 1, (n_emg - win_emg) // step_emg + 1)
+    return {
+        "win_eeg": win_eeg,
+        "win_emg": win_emg,
+        "step_eeg": step_eeg,
+        "step_emg": step_emg,
+        "n_steps": max(int(n_steps), 0),
+    }
+
+
 def _extract_features(
     eeg_ds: np.ndarray,
     emg: np.ndarray,
-    fs_ds: float,
+    fs_eeg: float,
     fs_emg: float,
-    n_steps: int,
-    win_eeg: int,
-    win_emg: int,
-    step_eeg: int,
-    step_emg: int,
+    windows: dict[str, int],
     params: StagingParams,
 ) -> dict[str, np.ndarray]:
-    emg_rms = np.zeros(n_steps, dtype=np.float64)
-    emg_p90 = np.zeros(n_steps, dtype=np.float64)
-    emg_cv = np.zeros(n_steps, dtype=np.float64)
-    delta = np.zeros(n_steps, dtype=np.float64)
-    theta = np.zeros(n_steps, dtype=np.float64)
-    eeg_hf = np.zeros(n_steps, dtype=np.float64)
+    n_steps = windows["n_steps"]
+    features = {
+        "delta": np.zeros(n_steps, dtype=np.float64),
+        "theta": np.zeros(n_steps, dtype=np.float64),
+        "sigma": np.zeros(n_steps, dtype=np.float64),
+        "beta": np.zeros(n_steps, dtype=np.float64),
+        "gamma": np.zeros(n_steps, dtype=np.float64),
+        "eeg_total": np.zeros(n_steps, dtype=np.float64),
+        "eeg_hf": np.zeros(n_steps, dtype=np.float64),
+        "eeg_delta_ratio": np.zeros(n_steps, dtype=np.float64),
+        "eeg_theta_ratio": np.zeros(n_steps, dtype=np.float64),
+        "eeg_spectral_entropy": np.zeros(n_steps, dtype=np.float64),
+        "emg_rms": np.zeros(n_steps, dtype=np.float64),
+        "emg_mean_abs": np.zeros(n_steps, dtype=np.float64),
+        "emg_std": np.zeros(n_steps, dtype=np.float64),
+        "emg_p90": np.zeros(n_steps, dtype=np.float64),
+        "emg_p95": np.zeros(n_steps, dtype=np.float64),
+        "emg_cv": np.zeros(n_steps, dtype=np.float64),
+        "emg_power": np.zeros(n_steps, dtype=np.float64),
+        "emg_burst_rate": np.zeros(n_steps, dtype=np.float64),
+        "emg_low": np.zeros(n_steps, dtype=np.float64),
+        "emg_mid": np.zeros(n_steps, dtype=np.float64),
+        "emg_high": np.zeros(n_steps, dtype=np.float64),
+        "emg_total": np.zeros(n_steps, dtype=np.float64),
+        "emg_mid_low_ratio": np.zeros(n_steps, dtype=np.float64),
+        "emg_high_mid_ratio": np.zeros(n_steps, dtype=np.float64),
+        "emg_spectral_entropy": np.zeros(n_steps, dtype=np.float64),
+        "emg_peak_freq": np.zeros(n_steps, dtype=np.float64),
+    }
+    emg_band = _bandpass_emg(emg, fs_emg, params.emg_low_band[0], params.emg_high_band[1])
 
     for idx in range(n_steps):
-        eeg_start = idx * step_eeg
-        emg_start = idx * step_emg
-        seg_eeg = eeg_ds[eeg_start : eeg_start + win_eeg]
-        seg_emg = emg[emg_start : emg_start + win_emg]
-        abs_emg = np.abs(seg_emg)
-        emg_rms[idx] = float(np.sqrt(np.mean(seg_emg**2)))
-        emg_p90[idx] = float(np.percentile(abs_emg, 90))
-        emg_cv[idx] = float(np.std(abs_emg) / (np.mean(abs_emg) + 1e-9))
-        delta[idx] = _band_power(seg_eeg, fs_ds, *params.delta_band)
-        theta[idx] = _band_power(seg_eeg, fs_ds, *params.theta_band)
-        eeg_hf[idx] = _band_power(seg_eeg, fs_ds, *params.high_frequency_band)
+        eeg_start = idx * windows["step_eeg"]
+        emg_start = idx * windows["step_emg"]
+        eeg_epoch = eeg_ds[eeg_start : eeg_start + windows["win_eeg"]]
+        emg_epoch = emg[emg_start : emg_start + windows["win_emg"]]
+        emg_band_epoch = emg_band[emg_start : emg_start + windows["win_emg"]]
 
-    return {
-        "emg_rms": emg_rms,
-        "emg_p90": emg_p90,
-        "emg_cv": emg_cv,
-        "delta": delta,
-        "theta": theta,
-        "eeg_hf": eeg_hf,
-    }
+        _fill_eeg_features(features, idx, eeg_epoch, fs_eeg, params)
+        _fill_emg_features(features, idx, emg_epoch, emg_band_epoch, fs_emg, params)
+
+    return features
+
+
+def _fill_eeg_features(
+    features: dict[str, np.ndarray],
+    idx: int,
+    eeg_epoch: np.ndarray,
+    fs: float,
+    params: StagingParams,
+) -> None:
+    eeg = np.asarray(eeg_epoch, dtype=np.float64)
+    eeg = eeg[np.isfinite(eeg)]
+    if eeg.size < 4:
+        return
+    freqs, psd = _welch(eeg - np.mean(eeg), fs)
+    delta = _band_power_from_psd(freqs, psd, params.delta_band)
+    theta = _band_power_from_psd(freqs, psd, params.theta_band)
+    total = _band_power_from_psd(freqs, psd, params.eeg_total_band)
+
+    features["delta"][idx] = delta
+    features["theta"][idx] = theta
+    features["sigma"][idx] = _band_power_from_psd(freqs, psd, params.sigma_band)
+    features["beta"][idx] = _band_power_from_psd(freqs, psd, params.beta_band)
+    features["gamma"][idx] = _band_power_from_psd(freqs, psd, params.gamma_band)
+    features["eeg_total"][idx] = total
+    features["eeg_hf"][idx] = _band_power_from_psd(freqs, psd, params.high_frequency_band)
+    features["eeg_delta_ratio"][idx] = delta / (total + EPS)
+    features["eeg_theta_ratio"][idx] = theta / (total + EPS)
+    features["eeg_spectral_entropy"][idx] = _spectral_entropy(freqs, psd, params.eeg_total_band)
+
+
+def _fill_emg_features(
+    features: dict[str, np.ndarray],
+    idx: int,
+    emg_epoch: np.ndarray,
+    emg_band_epoch: np.ndarray,
+    fs: float,
+    params: StagingParams,
+) -> None:
+    emg = np.asarray(emg_epoch, dtype=np.float64)
+    emg = emg[np.isfinite(emg)]
+    if emg.size == 0:
+        return
+
+    emg = emg - np.mean(emg)
+    abs_emg = np.abs(emg)
+    p90 = float(np.percentile(abs_emg, 90))
+    features["emg_rms"][idx] = float(np.sqrt(np.mean(emg * emg)))
+    features["emg_mean_abs"][idx] = float(np.mean(abs_emg))
+    features["emg_std"][idx] = float(np.std(emg))
+    features["emg_p90"][idx] = p90
+    features["emg_p95"][idx] = float(np.percentile(abs_emg, 95))
+    features["emg_cv"][idx] = float(np.std(abs_emg) / (np.mean(abs_emg) + EPS))
+    features["emg_power"][idx] = float(np.mean(emg * emg))
+    features["emg_burst_rate"][idx] = float(np.mean(abs_emg > p90))
+
+    if emg_band_epoch.size < 16:
+        return
+    freqs, psd = _welch(emg_band_epoch - np.mean(emg_band_epoch), fs)
+    low = _band_power_from_psd(freqs, psd, params.emg_low_band)
+    mid = _band_power_from_psd(freqs, psd, params.emg_mid_band)
+    high = _band_power_from_psd(freqs, psd, params.emg_high_band)
+    total = _band_power_from_psd(freqs, psd, (params.emg_low_band[0], params.emg_high_band[1]))
+
+    features["emg_low"][idx] = low
+    features["emg_mid"][idx] = mid
+    features["emg_high"][idx] = high
+    features["emg_total"][idx] = total
+    features["emg_mid_low_ratio"][idx] = mid / (low + EPS)
+    features["emg_high_mid_ratio"][idx] = high / (mid + EPS)
+    emg_total_band = (params.emg_low_band[0], params.emg_high_band[1])
+    features["emg_spectral_entropy"][idx] = _spectral_entropy(freqs, psd, emg_total_band)
+    features["emg_peak_freq"][idx] = _peak_frequency(freqs, psd, emg_total_band)
+
+
+def _emg_activity(features: dict[str, np.ndarray], params: StagingParams) -> np.ndarray:
+    geometric = (features["emg_rms"] * features["emg_p90"] * features["emg_cv"]) ** (1.0 / 3.0)
+    geometric = geometric / (np.max(geometric) + EPS)
+    mid = _percentile_normalize(np.log1p(np.maximum(features["emg_mid"], 0.0)), params)
+    mid_weight = float(np.clip(params.emg_mid_weight, 0.0, 1.0))
+    features["emg_geometric"] = geometric
+    return _percentile_normalize((1.0 - mid_weight) * geometric + mid_weight * mid, params)
 
 
 def _wake_score(
@@ -223,9 +350,7 @@ def _wake_score(
 def _sleep_td_threshold(td_norm: np.ndarray, wake_mask: np.ndarray, params: StagingParams) -> float:
     stride = max(1, int(round(params.epoch_sec / params.step_sec)))
     sleep_td = td_norm[::stride][~wake_mask[::stride]]
-    if len(sleep_td) > 5:
-        return _otsu_threshold(sleep_td)
-    return 0.5
+    return _otsu_threshold(sleep_td) if len(sleep_td) > 5 else 0.5
 
 
 def _postprocess_labels(
@@ -242,10 +367,11 @@ def _postprocess_labels(
     labels = _merge_short(labels, _steps(params.min_bout_sec, params.step_sec))
     labels = _enforce_valid_transitions(labels, wake_score_norm, td_norm, wake_thr, td_thr)
     labels = _validate_rem_anchor(labels, wake_score_norm, td_norm, wake_thr, td_thr, params)
+    labels = _merge_short(labels, _steps(params.min_bout_sec, params.step_sec))
     labels = _enforce_valid_transitions(labels, wake_score_norm, td_norm, wake_thr, td_thr)
     labels = _enforce_sleep_onset(labels, _steps(params.sleep_onset_nrem_sec, params.step_sec))
-    labels = _enforce_valid_transitions(labels, wake_score_norm, td_norm, wake_thr, td_thr)
     labels = _absorb_microarousals(labels, _steps(params.microarousal_sec, params.step_sec))
+    labels = _enforce_rem_after_nrem(labels)
     return _enforce_valid_transitions(labels, wake_score_norm, td_norm, wake_thr, td_thr)
 
 
@@ -333,12 +459,6 @@ def _validate_rem_anchor(
     return out
 
 
-def _resolve_non_rem(wake_score: float, td_score: float, wake_thr: float, td_thr: float) -> str:
-    wake_evidence = wake_score - wake_thr
-    nrem_evidence = td_thr - td_score
-    return WAKE if wake_evidence >= nrem_evidence else NREM
-
-
 def _enforce_sleep_onset(labels: np.ndarray, min_nrem_steps: int) -> np.ndarray:
     out = labels.copy()
     idx = 0
@@ -362,26 +482,83 @@ def _absorb_microarousals(labels: np.ndarray, max_wake_steps: int) -> np.ndarray
         changed = False
         idx = 1
         while idx < len(out) - 1:
-            if out[idx] == WAKE:
-                stop = idx
-                while stop < len(out) and out[stop] == WAKE:
-                    stop += 1
-                if stop - idx <= max_wake_steps and out[idx - 1] == NREM and stop < len(out) and out[stop] == NREM:
-                    out[idx:stop] = NREM
-                    changed = True
-                    idx = stop
-                    continue
+            if out[idx] != WAKE:
+                idx += 1
+                continue
+            stop = idx
+            while stop < len(out) and out[stop] == WAKE:
+                stop += 1
+            if stop - idx <= max_wake_steps and out[idx - 1] == NREM and stop < len(out) and out[stop] == NREM:
+                out[idx:stop] = NREM
+                changed = True
+                idx = stop
+                continue
             idx += 1
     return out
 
 
-def _band_power(segment: np.ndarray, fs: float, f_low: float, f_high: float) -> float:
-    freqs, psd = welch(segment, fs=fs, nperseg=min(len(segment), int(round(2 * fs))))
-    idx = np.where((freqs >= f_low) & (freqs <= f_high))[0]
-    if len(idx) == 0:
+def _enforce_rem_after_nrem(labels: np.ndarray) -> np.ndarray:
+    out = labels.copy()
+    idx = 0
+    while idx < len(out):
+        if out[idx] != REM:
+            idx += 1
+            continue
+        stop = idx
+        while stop < len(out) and out[stop] == REM:
+            stop += 1
+        if idx == 0 or out[idx - 1] != NREM:
+            out[idx:stop] = NREM
+        idx = stop
+    return out
+
+
+def _resolve_non_rem(wake_score: float, td_score: float, wake_thr: float, td_thr: float) -> str:
+    wake_evidence = wake_score - wake_thr
+    nrem_evidence = td_thr - td_score
+    return WAKE if wake_evidence >= nrem_evidence else NREM
+
+
+def _bandpass_emg(emg: np.ndarray, fs: float, low: float, high: float) -> np.ndarray:
+    signal = np.asarray(emg, dtype=np.float64)
+    if signal.size < 12:
+        return signal - np.mean(signal)
+    nyquist = fs / 2.0
+    high_eff = min(high, nyquist - 1.0)
+    if low <= 0 or high_eff <= low:
+        return signal - np.mean(signal)
+    b, a = butter(4, [low / nyquist, high_eff / nyquist], btype="band")
+    if signal.size <= 3 * max(len(a), len(b)):
+        return signal - np.mean(signal)
+    return filtfilt(b, a, signal)
+
+
+def _welch(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    return welch(signal, fs=fs, nperseg=min(len(signal), int(round(2 * fs))))
+
+
+def _band_power_from_psd(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
+    idx = (freqs >= band[0]) & (freqs < band[1])
+    if not np.any(idx):
         return 0.0
     integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(integrate(psd[idx], freqs[idx]))
+
+
+def _spectral_entropy(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
+    idx = (freqs >= band[0]) & (freqs < band[1])
+    power = np.asarray(psd[idx], dtype=np.float64)
+    if power.size == 0:
+        return 0.0
+    prob = power / (np.sum(power) + EPS)
+    return float(-np.sum(prob * np.log2(prob + EPS)) / np.log2(max(len(prob), 2)))
+
+
+def _peak_frequency(freqs: np.ndarray, psd: np.ndarray, band: tuple[float, float]) -> float:
+    idx = (freqs >= band[0]) & (freqs < band[1])
+    if not np.any(idx):
+        return 0.0
+    return float(freqs[idx][np.argmax(psd[idx])])
 
 
 def _otsu_threshold(values: np.ndarray) -> float:

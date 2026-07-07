@@ -86,7 +86,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--wake-mode", default="auto", choices=WAKE_MODES, help="Wake scoring mode; auto follows the reference dynamic-range rule.")
     parser.add_argument("--epoch-sec", type=float, default=5.0)
     parser.add_argument("--step-sec", type=float, default=1.0)
-    parser.add_argument("--eeg-hp", type=float, default=1.0, help="EEG high-pass cutoff in Hz.")
+    parser.add_argument("--eeg-hp", type=float, default=0.5, help="EEG high-pass cutoff in Hz.")
     parser.add_argument("--emg-hp", type=float, default=1.0, help="EMG high-pass cutoff in Hz.")
     parser.add_argument("--line-freq", type=float, default=50.0, help="Line-noise notch frequency in Hz.")
     parser.add_argument("--no-preprocess", action="store_true", help="Skip filtering before staging.")

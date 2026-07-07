@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib",
     "napari[pyqt6]",
     "numpy",
+    "pyqtgraph",
     "qtpy",
     "scipy",
 ]

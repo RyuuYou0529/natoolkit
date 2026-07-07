@@ -31,7 +31,7 @@ def preprocess_eeg_emg(
     eeg: np.ndarray,
     emg: np.ndarray,
     fs: float,
-    eeg_hp_cutoff: float = 1.0,
+    eeg_hp_cutoff: float = 0.5,
     emg_hp_cutoff: float = 1.0,
     line_freq: float = 50.0,
 ) -> tuple[np.ndarray, np.ndarray]:
