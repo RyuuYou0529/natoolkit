@@ -139,7 +139,17 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(root)
         layout.addWidget(self._controls())
-        layout.addWidget(self._timeline(), stretch=1)
+
+        figure_scroll = QtWidgets.QScrollArea()
+        figure_scroll.setWidgetResizable(True)
+        figure_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        figure_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        figure_scroll.setWidget(self._timeline())
+        layout.addWidget(figure_scroll, stretch=1)
 
         footer = QtWidgets.QHBoxLayout()
         self.cursor_info = QtWidgets.QLabel("Cursor: -")
@@ -150,6 +160,7 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         footer.addStretch(1)
         footer.addWidget(self.status)
         layout.addLayout(footer)
+
         self.setCentralWidget(root)
 
     def _controls(self) -> QtWidgets.QWidget:
@@ -226,19 +237,22 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         self.timeline = pg.GraphicsLayoutWidget()
         self.overview_plot = self._add_plot(row=0, height=55)
         self.spec_plot = self._add_plot(row=1, height=330)
-        self.emg_plot = self._add_plot(row=2, height=150)
-        self.auto_label_plot = self._add_plot(row=3, height=46)
-        self.final_label_plot = self._add_plot(row=4, height=54, epoch_selectable=True)
+        self.eeg_wave_plot = self._add_plot(row=2, height=150)
+        self.emg_plot = self._add_plot(row=3, height=150)
+        self.auto_label_plot = self._add_plot(row=4, height=46)
+        self.final_label_plot = self._add_plot(row=5, height=54, epoch_selectable=True)
 
         self.overview_image = pg.ImageItem()
         self.spec_image = pg.ImageItem()
         self.auto_label_image = pg.ImageItem()
         self.final_label_image = pg.ImageItem()
+        self.eeg_wave_curve = pg.PlotDataItem(pen=pg.mkPen("k", width=0.6))
         self.emg_curve = pg.PlotDataItem(pen=pg.mkPen("k", width=0.6))
         self.spec_image.setColorMap(self.spec_cmap)
 
         self.overview_plot.addItem(self.overview_image)
         self.spec_plot.addItem(self.spec_image)
+        self.eeg_wave_plot.addItem(self.eeg_wave_curve)
         self.emg_plot.addItem(self.emg_curve)
         self.auto_label_plot.addItem(self.auto_label_image)
         self.final_label_plot.addItem(self.final_label_image)
@@ -256,9 +270,10 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         self.spec_colorbar.setImageItem(self.spec_image)
         self.timeline.ci.layout.setColumnFixedWidth(0, 70)
         self.timeline.ci.layout.setColumnFixedWidth(2, 86)
-        for row, text in enumerate(("Overview", "EEG", "EMG", "Auto", "Final")):
+        for row, text in enumerate(("Overview", "EEG Power", "EEG Raw", "EMG", "Auto", "Final")):
             self.timeline.addItem(_row_label(text), row=row, col=0)
-        self.timeline.addItem(_stage_legend(), row=2, col=2, rowspan=3, colspan=1)
+        self.timeline.addItem(_stage_legend(), row=3, col=2, rowspan=3, colspan=1)
+        self.timeline.setMinimumHeight(840)
 
         self.focus_left_region = pg.LinearRegionItem(
             values=(0, 0),
@@ -307,11 +322,13 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
             pg.mkPen(30, 30, 30, 180),
             pg.mkPen(30, 30, 30, 180),
             pg.mkPen(30, 30, 30, 180),
+            pg.mkPen(30, 30, 30, 180),
         )
         for plot, pen in zip(
             (
                 self.overview_plot,
                 self.spec_plot,
+                self.eeg_wave_plot,
                 self.emg_plot,
                 self.auto_label_plot,
                 self.final_label_plot,
@@ -442,6 +459,7 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
     def _plot_results(self) -> None:
         self._plot_overview()
         self._plot_spectrogram()
+        self._plot_eeg_waveform()
         self._plot_emg()
         self._refresh_labels()
         self._update_cursor()
@@ -463,6 +481,17 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         rect = _image_rect(times, freqs, self.duration_sec)
         self.spec_image.setRect(rect)
         self.spec_plot.setYRange(0, 30, padding=0)
+
+    def _plot_eeg_waveform(self) -> None:
+        eeg = self.recording.eeg
+        step = max(1, len(eeg) // 80000)
+        lo, hi = (float(v) for v in np.percentile(eeg, (0.5, 99.5)))
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            lo, hi = -1.0, 1.0
+        time = np.arange(len(eeg), dtype=float) / self.recording.fs
+        self.eeg_wave_curve.setData(time[::step], np.clip(eeg, lo, hi)[::step])
+        margin = max((hi - lo) * 0.1, 1e-9)
+        self.eeg_wave_plot.setYRange(lo - margin, hi + margin, padding=0)
 
     def _plot_emg(self) -> None:
         step = max(1, len(self.emg) // 80000)
@@ -514,6 +543,7 @@ class SleepStateReviewWindow(QtWidgets.QMainWindow):
         self.view_start, self.view_stop = start, stop
         for plot in (
             self.spec_plot,
+            self.eeg_wave_plot,
             self.emg_plot,
             self.auto_label_plot,
             self.final_label_plot,
