@@ -15,10 +15,13 @@ dependencies = [
     "pyqtgraph",
     "qtpy",
     "scipy",
+    "tifffile",
 ]
 
 [project.scripts]
 activity-tracer = "natoolkit.tools.activity_tracer.gui:main"
+activity-sleep-state-aligner = "natoolkit.tools.activity_sleep_state_aligner.gui:main"
+sleep-state-staging = "natoolkit.tools.sleep_state_staging.gui:main"
 
 [project.entry-points."napari.manifest"]
 natoolkit = "natoolkit:napari.yaml"

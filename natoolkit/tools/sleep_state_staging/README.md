@@ -64,6 +64,12 @@ sleep_state_hypnogram.pdf
 Launch the minimal review GUI with:
 
 ```bash
+sleep-state-staging
+```
+
+or:
+
+```bash
 python -m natoolkit.tools.sleep_state_staging.gui
 ```
 

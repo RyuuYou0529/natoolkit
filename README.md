@@ -5,6 +5,8 @@ Lab-internal tools for neural activity data analysis.
 ## Current tools
 
 - Activity Tracer: import movie data in napari, draw ROI labels, and export activity traces.
+- Sleep State Staging: classify and manually review EEG/EMG sleep states.
+- Activity–Sleep State Aligner: append sleep-state labels to exported activity traces.
 
 ## Install
 
