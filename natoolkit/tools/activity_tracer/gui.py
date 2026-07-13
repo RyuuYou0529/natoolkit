@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
 import napari
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
 from napari.layers import Image, Labels
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QTimer
+from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
@@ -22,135 +20,37 @@ from qtpy.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
-    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
-from scipy.ndimage import median_filter
-from scipy.signal import butter, filtfilt, find_peaks
 
-
-@dataclass
-class MovieState:
-    start: int = 0
-    stop: int = 0
-    layer_name: str = ""
-    source_data: np.ndarray | None = None
-    spatial_reference: str = ""
-    temporal_reference: str = ""
-    traces: dict[int, np.ndarray] = field(default_factory=dict)
-    visible_rois: set[int] = field(default_factory=set)
-    spikes: dict[int, list[dict[str, float]]] = field(default_factory=dict)
-
-
-class ActivityPlot(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        self.figure = Figure(figsize=(7, 3))
-        self.canvas = FigureCanvas(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        self.ax = self.figure.add_subplot(111)
-        self.time_line = None
-        self.current_frame = 0
-        self.x_limits: tuple[float, float] | None = None
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
-
-        zoom_layout = QHBoxLayout()
-        self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setRange(1, 100)
-        self.zoom_slider.setValue(1)
-        self.zoom_slider.valueChanged.connect(lambda _=0: self.apply_zoom())
-        zoom_layout.addWidget(QLabel("Zoom"))
-        zoom_layout.addWidget(self.zoom_slider)
-        layout.addLayout(zoom_layout)
-
-        self.canvas.mpl_connect("scroll_event", self.on_scroll)
-        self.draw_empty()
-
-    def draw_empty(self, message: str = "No traced activities") -> None:
-        self.ax.clear()
-        self.ax.text(0.5, 0.5, message, ha="center", va="center", transform=self.ax.transAxes)
-        self.ax.set_axis_off()
-        self.time_line = None
-        self.x_limits = None
-        self.canvas.draw_idle()
-
-    def draw_traces(self, states: list[MovieState], mode: str, normalize) -> None:
-        self.ax.clear()
-        self.ax.set_axis_on()
-        shown = [
-            (state, roi)
-            for state in states
-            for roi in sorted(state.visible_rois)
-            if roi in state.traces
-        ]
-        if not shown:
-            self.draw_empty("No visible traces")
-            return
-
-        for state, roi in shown:
-            trace = normalize(state.traces[roi])
-            frames = np.arange(len(trace))
-            self.ax.plot(frames, trace, lw=1.2, label=f"{state.layer_name} / ROI {roi}")
-            spike_frames = [int(spike["frame"]) for spike in state.spikes.get(roi, [])]
-            spike_frames = [frame for frame in spike_frames if frame < len(trace)]
-            if spike_frames:
-                self.ax.scatter(spike_frames, trace[spike_frames], c="red", s=24, marker="v", zorder=5)
-
-        stops = [len(state.traces[roi]) - 1 for state, roi in shown]
-        self.ax.set_title(f"Activities ({mode})")
-        self.ax.set_xlabel("Cropped frame")
-        self.ax.set_ylabel(mode)
-        self.ax.legend(loc="upper right", fontsize=8)
-        self.ax.grid(True, alpha=0.2)
-        self.time_line = self.ax.axvline(self.current_frame, color="black", lw=1.0, alpha=0.8)
-        self.x_limits = (0.0, float(max(max(stops), 1)))
-        self.apply_zoom(redraw=False)
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.84, bottom=0.24)
-        self.canvas.draw_idle()
-
-    def set_frame(self, frame: int) -> None:
-        self.current_frame = frame
-        if self.time_line is not None:
-            self.time_line.set_xdata([frame, frame])
-            self.apply_zoom(redraw=False)
-            self.canvas.draw_idle()
-
-    def on_scroll(self, event) -> None:
-        if event.inaxes is not self.ax:
-            return
-        step = 8 if event.button == "up" else -8
-        value = min(max(self.zoom_slider.value() + step, self.zoom_slider.minimum()), self.zoom_slider.maximum())
-        self.zoom_slider.setValue(value)
-
-    def apply_zoom(self, redraw: bool = True) -> None:
-        if self.x_limits is None:
-            return
-        xmin, xmax = self.x_limits
-        width = xmax - xmin + 1
-        zoom = self.zoom_slider.value()
-        if zoom == 1:
-            self.ax.set_xlim(xmin, xmax)
-        else:
-            half = width / zoom / 2
-            center = min(max(self.current_frame, xmin + half), xmax - half)
-            self.ax.set_xlim(center - half, center + half)
-        if redraw:
-            self.canvas.draw_idle()
+from .models import MovieState, ROISet
+from .plot import ActivityPlot
+from .processing import (
+    FrameSettings,
+    find_frame_spikes,
+    normalize_trace as normalize_activity_trace,
+    process_frame_trace,
+)
+from .roi import roi_ids
 
 
 class SimpleTracerWidget(QWidget):
-    roi_layer_name = "Shared ROIs"
+    roi_layer_name = "ROIs"
 
     def __init__(self, viewer: napari.Viewer, plot: ActivityPlot) -> None:
         super().__init__()
         self.viewer = viewer
         self.movie_states: dict[int, MovieState] = {}
         self.roi_layer: Labels | None = None
+        self.shared_roi_set: ROISet | None = None
+        self.roi_target_movie: Image | None = None
+        self.roi_reference_movie: Image | None = None
+        self.selected_movie: Image | None = None
+        self.roi_mode_name = "Shared"
+        self.next_trace_color = 0
+        self.removing_roi_layer = False
         self.syncing = False
         self.spatial_ref_name: str | None = None
         self.spatial_ref_shape: tuple[int, int] | None = None
@@ -161,6 +61,8 @@ class SimpleTracerWidget(QWidget):
         self._build_ui()
         self._connect_events()
         self.sync_from_selection()
+        self.refresh_roi_targets()
+        QTimer.singleShot(0, self.reload_roi_layer)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -225,30 +127,68 @@ class SimpleTracerWidget(QWidget):
 
         roi_group = QGroupBox("ROIs")
         roi_layout = QVBoxLayout(roi_group)
-        create_roi_button = QPushButton("Create Shared Labels")
+        self.roi_mode_combo = QComboBox()
+        self.roi_mode_combo.addItems(["Shared", "Unique"])
+        self.roi_mode_combo.currentTextChanged.connect(self.switch_roi_mode)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode"))
+        mode_row.addWidget(self.roi_mode_combo)
+        roi_layout.addLayout(mode_row)
+
+        self.show_roi_checkbox = QCheckBox("Show ROI layer")
+        self.show_roi_checkbox.setChecked(False)
+        self.show_roi_checkbox.toggled.connect(self.toggle_roi_layer)
+        roi_layout.addWidget(self.show_roi_checkbox)
+
+        target_label = QLabel("Target video")
+        self.roi_target_combo = QComboBox()
+        self.roi_target_combo.currentIndexChanged.connect(self.switch_roi_target)
+        roi_layout.addWidget(target_label)
+        roi_layout.addWidget(self.roi_target_combo)
+
+        self.roi_reference_label = QLabel("Reference: none")
+        set_reference_button = QPushButton("Set as Reference")
+        copy_reference_button = QPushButton("Copy from Reference")
+        set_reference_button.clicked.connect(lambda _=False: self.set_roi_reference())
+        copy_reference_button.clicked.connect(lambda _=False: self.copy_roi_reference())
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(set_reference_button)
+        reference_row.addWidget(copy_reference_button)
+        roi_layout.addWidget(self.roi_reference_label)
+        roi_layout.addLayout(reference_row)
+
         load_roi_button = QPushButton("Load ROI Labels")
         save_roi_button = QPushButton("Export ROI Labels")
-        create_roi_button.clicked.connect(lambda _=False: self.create_roi_layer())
         load_roi_button.clicked.connect(lambda _=False: self.load_roi_labels())
         save_roi_button.clicked.connect(lambda _=False: self.export_roi_labels())
-        roi_row_1 = QHBoxLayout()
-        roi_row_1.addWidget(create_roi_button)
-        roi_row_1.addWidget(load_roi_button)
-        roi_layout.addLayout(roi_row_1)
-        roi_layout.addWidget(save_roi_button)
+        roi_file_row = QHBoxLayout()
+        roi_file_row.addWidget(load_roi_button)
+        roi_file_row.addWidget(save_roi_button)
+        roi_layout.addLayout(roi_file_row)
+        self.unique_roi_widgets = [
+            target_label,
+            self.roi_target_combo,
+            self.roi_reference_label,
+            set_reference_button,
+            copy_reference_button,
+        ]
+        for widget in self.unique_roi_widgets:
+            widget.setEnabled(False)
         controls_layout.addWidget(roi_group)
 
         trace_group = QGroupBox("Activities")
         trace_layout = QVBoxLayout(trace_group)
         norm_layout = QHBoxLayout()
         self.norm_combo = QComboBox()
-        self.norm_combo.addItems(["Raw", "dF/F0", "-dF/F0", "SNR(-dF/F0)", "FRAME_SNR", "Z-score", "Min-max"])
+        self.norm_combo.addItems(["Raw", "dF/F0", "SNR(dF/F0)", "FRAME_SNR", "Z-score", "Min-max"])
+        self.negative_signal_checkbox = QCheckBox("Negative-going signal")
         self.f0_spin = QSpinBox()
         self.f0_spin.setRange(0, 100)
         self.f0_spin.setValue(10)
         self.f0_spin.setSuffix("%")
         self.norm_combo.currentTextChanged.connect(lambda _="": self.redraw_plot())
         self.f0_spin.valueChanged.connect(lambda _=0: self.redraw_plot())
+        self.negative_signal_checkbox.toggled.connect(self.change_signal_polarity)
         norm_layout.addWidget(QLabel("Normalize"))
         norm_layout.addWidget(self.norm_combo)
         norm_layout.addWidget(QLabel("F0"))
@@ -257,11 +197,12 @@ class SimpleTracerWidget(QWidget):
         export_button = QPushButton("Export Activities")
         show_all_button = QPushButton("Show All Traces")
         hide_all_button = QPushButton("Hide All Traces")
-        extract_button.clicked.connect(lambda _=False: self.extract_active_movie())
+        extract_button.clicked.connect(lambda _=False: self.extract_all_movies())
         export_button.clicked.connect(lambda _=False: self.export_activities())
         show_all_button.clicked.connect(lambda _=False: self.set_all_roi_visibility(True))
         hide_all_button.clicked.connect(lambda _=False: self.set_all_roi_visibility(False))
         trace_layout.addLayout(norm_layout)
+        trace_layout.addWidget(self.negative_signal_checkbox)
         activity_row_1 = QHBoxLayout()
         activity_row_1.addWidget(extract_button)
         activity_row_1.addWidget(export_button)
@@ -280,7 +221,7 @@ class SimpleTracerWidget(QWidget):
         trace_layout.addWidget(self.roi_scroll)
         controls_layout.addWidget(trace_group)
 
-        spike_group = QGroupBox("FRAME_Spike")
+        spike_group = QGroupBox("Spike")
         spike_layout = QVBoxLayout(spike_group)
         self.spike_fps_spin = QSpinBox()
         self.spike_fps_spin.setRange(1, 100000)
@@ -323,7 +264,7 @@ class SimpleTracerWidget(QWidget):
         spike_row_3.addWidget(QLabel("High"))
         spike_row_3.addWidget(self.spike_highpass_spin)
 
-        detect_button = QPushButton("Detect FRAME_Spike")
+        detect_button = QPushButton("Detect Spike")
         export_spike_button = QPushButton("Export Spikes")
         detect_button.clicked.connect(lambda _=False: self.detect_frame_spikes())
         export_spike_button.clicked.connect(lambda _=False: self.export_spikes())
@@ -341,6 +282,9 @@ class SimpleTracerWidget(QWidget):
 
     def _connect_events(self) -> None:
         self.viewer.layers.selection.events.changed.connect(self.sync_from_selection)
+        self.viewer.layers.events.inserted.connect(self.on_layer_inserted)
+        self.viewer.layers.events.removing.connect(self.on_layer_removing)
+        self.viewer.layers.events.removed.connect(self.on_layer_removed)
         self.viewer.dims.events.current_step.connect(self.sync_time_line)
         self.start_spin.valueChanged.connect(self.save_time_roi)
         self.stop_spin.valueChanged.connect(self.save_time_roi)
@@ -349,9 +293,14 @@ class SimpleTracerWidget(QWidget):
         layer = self.viewer.layers.selection.active
         return layer if isinstance(layer, Image) else None
 
+    def current_image_layer(self) -> Image | None:
+        return self.active_image_layer() or self.selected_movie
+
     def state_for(self, layer: Image) -> MovieState:
         key = id(layer)
-        state = self.movie_states.setdefault(key, MovieState())
+        if key not in self.movie_states:
+            self.movie_states[key] = MovieState()
+        state = self.movie_states[key]
         if state.source_data is None:
             state.source_data = layer.data
             state.stop = int(layer.data.shape[0])
@@ -391,7 +340,19 @@ class SimpleTracerWidget(QWidget):
         )
 
     def sync_from_selection(self, event=None) -> None:
-        layer = self.active_image_layer()
+        active = self.active_image_layer()
+        target_changed = active is not None and active is not self.roi_target_movie
+        if target_changed and self.roi_mode_name == "Unique":
+            self.save_roi_layer()
+        if active is not None:
+            self.selected_movie = active
+            self.roi_target_movie = active
+            index = self.roi_target_combo.findData(active)
+            if index >= 0:
+                self.roi_target_combo.blockSignals(True)
+                self.roi_target_combo.setCurrentIndex(index)
+                self.roi_target_combo.blockSignals(False)
+        layer = self.current_image_layer()
         self.syncing = True
         if layer is None:
             self.active_label.setText("Active movie: none")
@@ -415,6 +376,8 @@ class SimpleTracerWidget(QWidget):
             self.redraw_plot()
         self.update_movie_info(layer)
         self.syncing = False
+        if target_changed and self.roi_mode_name == "Unique":
+            self.reload_roi_layer()
         self.sync_time_line()
 
     def save_time_roi(self) -> None:
@@ -555,83 +518,262 @@ class SimpleTracerWidget(QWidget):
             self.state_for(last_layer)
         self.viewer.layers.selection.active = last_layer
         self.sync_from_selection()
+        self.refresh_roi_targets()
 
     def current_roi_layer(self) -> Labels | None:
-        if self.roi_layer is not None:
-            for layer in self.viewer.layers:
-                if layer is self.roi_layer:
-                    return layer
-        for layer in self.viewer.layers:
-            if isinstance(layer, Labels) and layer.name == self.roi_layer_name:
-                self.roi_layer = layer
-                return layer
-        return None
+        return self.roi_layer if self.roi_layer is not None and self.roi_layer in self.viewer.layers else None
 
-    def create_roi_layer(self) -> None:
-        shape = self.reference_image_shape()
-        if shape is None:
-            self.set_status("Import or select a movie before creating ROIs.")
+    def roi_set_for(
+        self,
+        mode: str | None = None,
+        movie: Image | None = None,
+        create: bool = True,
+    ) -> ROISet | None:
+        mode = mode or self.roi_mode_name
+        movie = movie or self.roi_target_movie or self.selected_movie
+        if movie is None:
+            return None
+        if mode == "Shared":
+            if self.shared_roi_set is None and create:
+                self.shared_roi_set = ROISet(np.zeros(movie.data.shape[-2:], dtype=np.uint16))
+            return self.shared_roi_set
+        state = self.state_for(movie)
+        if state.roi_set is None and create:
+            state.roi_set = ROISet(np.zeros(movie.data.shape[-2:], dtype=np.uint16))
+        return state.roi_set
+
+    def save_roi_layer(
+        self,
+        mode: str | None = None,
+        movie: Image | None = None,
+        layer: Labels | None = None,
+    ) -> None:
+        layer = layer or self.current_roi_layer()
+        roi_set = self.roi_set_for(mode, movie)
+        if layer is None or roi_set is None:
+            return
+        labels = np.asarray(layer.data)
+        if np.array_equal(labels, roi_set.labels):
+            return
+        roi_set.labels = labels.copy()
+        if (mode or self.roi_mode_name) == "Shared":
+            states = self.movie_states.values()
+        else:
+            target = movie or self.roi_target_movie
+            states = [self.state_for(target)] if target is not None else []
+        for state in states:
+            state.traces.clear()
+            state.visible_rois.clear()
+            state.spikes.clear()
+
+    def reload_roi_layer(self) -> None:
+        if not self.show_roi_checkbox.isChecked():
+            return
+        roi_set = self.roi_set_for()
+        if roi_set is None:
+            return
+        layer = self.current_roi_layer()
+        name = "Shared ROIs" if self.roi_mode_name == "Shared" else f"ROIs: {self.roi_target_movie.name}"
+        if layer is None:
+            layer = Labels(roi_set.labels.copy(), name=name)
+            self.roi_layer = layer
+            self.viewer.layers.append(layer)
+        else:
+            layer.data = roi_set.labels.copy()
+            layer.name = name
+
+    def toggle_roi_layer(self, checked: bool) -> None:
+        if checked:
+            self.reload_roi_layer()
             return
         layer = self.current_roi_layer()
         if layer is None:
-            layer = self.viewer.add_labels(np.zeros(shape, dtype=np.uint16), name=self.roi_layer_name)
-            self.roi_layer = layer
-        self.viewer.layers.selection.active = layer
-        self.set_status("Draw labels with nonzero IDs. Re-extract after editing ROIs.")
+            return
+        self.save_roi_layer()
+        self.removing_roi_layer = True
+        self.viewer.layers.remove(layer)
+        self.removing_roi_layer = False
 
-    def reference_image_shape(self) -> tuple[int, int] | None:
-        layer = self.active_image_layer()
-        if layer is not None:
-            return tuple(layer.data.shape[-2:])
-        for candidate in self.viewer.layers:
-            if isinstance(candidate, Image):
-                return tuple(candidate.data.shape[-2:])
-        return None
+    def on_layer_removing(self, event) -> None:
+        layer = self.viewer.layers[event.index]
+        if isinstance(layer, Image):
+            if layer is self.roi_target_movie and self.roi_mode_name == "Unique":
+                self.save_roi_layer(movie=layer)
+            return
+        if layer is not self.roi_layer:
+            return
+        if not self.removing_roi_layer:
+            self.save_roi_layer(layer=layer)
+        self.roi_layer = None
+        self.show_roi_checkbox.blockSignals(True)
+        self.show_roi_checkbox.setChecked(False)
+        self.show_roi_checkbox.blockSignals(False)
+
+    def on_layer_inserted(self, event) -> None:
+        layer = event.value
+        if not isinstance(layer, Image):
+            return
+        self.state_for(layer)
+        if self.roi_target_movie is None:
+            self.roi_target_movie = layer
+        self.refresh_roi_targets()
+        if self.show_roi_checkbox.isChecked() and self.current_roi_layer() is None:
+            QTimer.singleShot(0, self.reload_roi_layer)
+
+    def on_layer_removed(self, event) -> None:
+        layer = event.value
+        if not isinstance(layer, Image):
+            return
+        previous_target = self.roi_target_movie
+        if layer is self.selected_movie:
+            self.selected_movie = self.active_image_layer()
+        self.refresh_roi_targets()
+        if previous_target is not self.roi_target_movie and self.roi_mode_name == "Unique":
+            QTimer.singleShot(0, self.reload_roi_layer)
+
+    def switch_roi_mode(self, mode: str) -> None:
+        if mode == self.roi_mode_name:
+            return
+        self.save_roi_layer(mode=self.roi_mode_name)
+        self.roi_mode_name = mode
+        for widget in self.unique_roi_widgets:
+            widget.setEnabled(mode == "Unique" and self.roi_target_combo.count() > 0)
+        self.reload_roi_layer()
+        self.set_status(f"ROI mode changed to {mode}.")
+
+    def refresh_roi_targets(self) -> None:
+        movies = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        if self.roi_target_movie not in movies:
+            self.roi_target_movie = (
+                self.selected_movie
+                if self.selected_movie in movies
+                else (movies[0] if movies else None)
+            )
+        if self.roi_reference_movie not in movies:
+            self.roi_reference_movie = None
+        self.roi_target_combo.blockSignals(True)
+        self.roi_target_combo.clear()
+        for movie in movies:
+            self.roi_target_combo.addItem(movie.name, movie)
+        index = self.roi_target_combo.findData(self.roi_target_movie)
+        if index >= 0:
+            self.roi_target_combo.setCurrentIndex(index)
+        self.roi_target_combo.blockSignals(False)
+        reference = self.roi_reference_movie.name if self.roi_reference_movie is not None else "none"
+        self.roi_reference_label.setText(f"Reference: {reference}")
+        self.show_roi_checkbox.setEnabled(bool(movies))
+        for widget in self.unique_roi_widgets:
+            widget.setEnabled(self.roi_mode_name == "Unique" and bool(movies))
+
+    def switch_roi_target(self, index: int) -> None:
+        if self.syncing:
+            return
+        movie = self.roi_target_combo.itemData(index)
+        if movie is None or movie is self.roi_target_movie:
+            return
+        if self.roi_mode_name == "Unique":
+            self.save_roi_layer()
+        self.roi_target_movie = movie
+        self.selected_movie = movie
+        self.viewer.layers.selection.active = movie
+        if self.roi_mode_name == "Unique":
+            self.reload_roi_layer()
+
+    def set_roi_reference(self) -> None:
+        self.save_roi_layer()
+        if self.roi_target_movie is None:
+            self.set_status("Select a target video first.")
+            return
+        self.roi_reference_movie = self.roi_target_movie
+        self.roi_reference_label.setText(f"Reference: {self.roi_reference_movie.name}")
+        self.set_status(f"ROI reference set to {self.roi_reference_movie.name}.")
+
+    def copy_roi_reference(self) -> None:
+        self.save_roi_layer()
+        source = self.roi_set_for("Unique", self.roi_reference_movie, create=False)
+        target = self.roi_target_movie
+        if source is None or target is None:
+            self.set_status("Set an ROI reference and select a target video first.")
+            return
+        if source.labels.shape != tuple(target.data.shape[-2:]):
+            self.set_status("Reference ROIs must match the target movie Y/X shape.")
+            return
+        state = self.state_for(target)
+        state.roi_set = ROISet(source.labels.copy())
+        state.traces.clear()
+        state.visible_rois.clear()
+        state.spikes.clear()
+        self.reload_roi_layer()
+        self.set_status(f"Copied ROIs from {self.roi_reference_movie.name} to {target.name}.")
+
+    def roi_labels_for(self, movie: Image) -> np.ndarray | None:
+        roi_set = self.roi_set_for(self.roi_mode_name, movie, create=False)
+        return None if roi_set is None else roi_set.labels
 
     def load_roi_labels(self) -> None:
+        movie = self.roi_target_movie or self.current_image_layer()
+        if movie is None:
+            self.set_status("Select a movie before loading ROI labels.")
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load ROI labels", filter="NumPy labels (*.npy)")
         if not path:
             return
         labels = np.load(path)
-        layer = self.current_roi_layer()
-        if layer is None:
-            self.roi_layer = self.viewer.add_labels(labels, name=self.roi_layer_name)
+        if labels.shape != tuple(movie.data.shape[-2:]):
+            self.set_status("ROI labels must match the movie Y/X shape.")
+            return
+        if self.roi_mode_name == "Shared":
+            self.shared_roi_set = ROISet(labels)
+            states = self.movie_states.values()
         else:
-            layer.data = labels
-        self.set_status("ROI labels loaded. Re-extract activities for updated ROIs.")
+            state = self.state_for(movie)
+            state.roi_set = ROISet(labels)
+            states = [state]
+        for state in states:
+            state.traces.clear()
+            state.visible_rois.clear()
+            state.spikes.clear()
+        self.reload_roi_layer()
+        self.set_status(f"ROI labels loaded in {self.roi_mode_name} mode.")
 
     def export_roi_labels(self) -> None:
-        layer = self.current_roi_layer()
-        if layer is None:
-            self.set_status("Create or load ROI labels first.")
+        self.save_roi_layer()
+        roi_set = self.roi_set_for(create=False)
+        if roi_set is None:
+            self.set_status("Create, copy, or load ROI labels first.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export ROI labels", filter="NumPy labels (*.npy)")
         if not path:
             return
         if not path.endswith(".npy"):
             path += ".npy"
-        np.save(path, np.asarray(layer.data))
+        np.save(path, roi_set.labels)
         self.set_status(f"ROI labels exported to {path}.")
 
-    def extract_active_movie(self) -> None:
-        layer = self.active_image_layer()
-        if layer is None:
-            self.set_status("Select a movie layer first.")
+    def extract_all_movies(self) -> None:
+        self.save_roi_layer()
+        movies = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        if not movies:
+            self.set_status("Import movies before extracting activities.")
             return
-        count = self.trace_movie(layer)
-        if count is not None:
-            self.rebuild_roi_controls()
-            self.redraw_plot()
-            self.set_status(f"Extracted {count} ROI traces from {layer.name}.")
+        results = [(layer, self.trace_movie(layer)) for layer in movies]
+        completed = [(layer, count) for layer, count in results if count is not None]
+        failed = [layer.name for layer, count in results if count is None]
+        self.rebuild_roi_controls()
+        self.redraw_plot()
+        total = sum(count for _, count in completed)
+        message = f"Extracted {total} ROI traces from {len(completed)} movies."
+        if failed:
+            message += f" Skipped: {', '.join(failed)}."
+        self.set_status(message)
 
     def trace_movie(self, layer: Image, visible_rois: set[int] | None = None) -> int | None:
-        roi_layer = self.current_roi_layer()
-        if roi_layer is None:
-            self.set_status("Create or load ROI labels first.")
-            return None
-
+        self.save_roi_layer()
         state = self.state_for(layer)
-        labels = np.asarray(roi_layer.data)
+        labels = self.roi_labels_for(layer)
+        if labels is None:
+            self.set_status("Create, copy, or load ROI labels first.")
+            return None
         if state.start >= state.stop:
             self.set_status("TimeROI is empty. Set Start smaller than Stop.")
             return None
@@ -639,15 +781,19 @@ class SimpleTracerWidget(QWidget):
             self.set_status("ROI labels must match the movie Y/X shape.")
             return None
         movie = np.asarray(layer.data)
-        roi_ids = np.unique(labels)
-        roi_ids = roi_ids[roi_ids > 0]
+        ids = roi_ids(labels)
         flat_movie = movie.reshape(movie.shape[0], -1)
         flat_labels = labels.reshape(-1)
 
         state.traces = {
             int(roi_id): flat_movie[:, flat_labels == roi_id].mean(axis=1)
-            for roi_id in roi_ids
+            for roi_id in ids
         }
+        for roi in state.traces:
+            if roi not in state.trace_colors:
+                hue = self.next_trace_color * 137 % 360
+                state.trace_colors[roi] = QColor.fromHsv(hue, 180, 220).name()
+                self.next_trace_color += 1
         state.spikes.clear()
         state.visible_rois = set(state.traces) if visible_rois is None else set(state.traces) & visible_rois
         if not state.visible_rois:
@@ -655,7 +801,7 @@ class SimpleTracerWidget(QWidget):
         return len(state.traces)
 
     def detect_frame_spikes(self) -> None:
-        layer = self.active_image_layer()
+        layer = self.current_image_layer()
         if layer is None:
             self.set_status("Select a movie layer first.")
             return
@@ -677,57 +823,26 @@ class SimpleTracerWidget(QWidget):
         self.set_status(f"Detected {count} FRAME_Spike events in {layer.name}.")
 
     def frame_spikes_for_trace(self, trace: np.ndarray) -> list[dict[str, float]]:
-        processed = self.frame_processed_trace(trace)
-        snr_trace = processed["snr_trace"]
-        noise = float(processed["noise"])
-        distance = max(1, int(round(self.spike_isi_spin.value() * self.spike_fps_spin.value() / 1000)))
-        peaks, _ = find_peaks(
-            snr_trace,
-            height=self.spike_threshold_spin.value(),
-            distance=distance,
-        )
-        return [
-            {
-                "frame": int(frame),
-                "peak": float(processed["spike_trace"][frame]),
-                "noise": noise,
-                "snr": float(snr_trace[frame]),
-            }
-            for frame in peaks
-        ]
+        return find_frame_spikes(trace, self.frame_settings())
 
     def frame_processed_trace(self, trace: np.ndarray) -> dict[str, np.ndarray | float]:
-        fps = self.spike_fps_spin.value()
-        nyquist = fps / 2
-        baseline_frames = max(1, int(round(self.spike_baseline_spin.value() * fps / 1000)))
-        lowpass_hz = self.spike_lowpass_spin.value()
-        highpass_hz = self.spike_highpass_spin.value()
-        if lowpass_hz >= nyquist or highpass_hz >= nyquist:
-            return {
-                "baseline": np.zeros_like(trace, dtype=float),
-                "detrended": np.zeros_like(trace, dtype=float),
-                "suprathreshold": np.zeros_like(trace, dtype=float),
-                "spike_trace": np.zeros_like(trace, dtype=float),
-                "noise": 0.0,
-                "snr_trace": np.zeros_like(trace, dtype=float),
-            }
+        return process_frame_trace(trace, self.frame_settings())
 
-        baseline = median_filter(trace, size=baseline_frames, mode="nearest")
-        detrended = np.asarray(trace, dtype=float) - baseline
-        b, a = butter(5, lowpass_hz / nyquist, btype="low")
-        suprathreshold = filtfilt(b, a, detrended)
-        spike_trace = -suprathreshold
-        b, a = butter(5, highpass_hz / nyquist, btype="high")
-        noise = float(np.std(filtfilt(b, a, spike_trace)))
-        snr_trace = spike_trace / noise if noise else np.zeros_like(spike_trace)
-        return {
-            "baseline": baseline,
-            "detrended": detrended,
-            "suprathreshold": suprathreshold,
-            "spike_trace": spike_trace,
-            "noise": noise,
-            "snr_trace": snr_trace,
-        }
+    def frame_settings(self) -> FrameSettings:
+        return FrameSettings(
+            fps=self.spike_fps_spin.value(),
+            baseline_ms=self.spike_baseline_spin.value(),
+            lowpass_hz=self.spike_lowpass_spin.value(),
+            highpass_hz=self.spike_highpass_spin.value(),
+            isi_ms=self.spike_isi_spin.value(),
+            threshold=self.spike_threshold_spin.value(),
+            negative_signal=self.negative_signal_checkbox.isChecked(),
+        )
+
+    def change_signal_polarity(self, _checked: bool) -> None:
+        for state in self.movie_states.values():
+            state.spikes.clear()
+        self.redraw_plot()
 
     def export_spikes(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export FRAME_Spike events", filter="CSV (*.csv)")
@@ -788,33 +903,23 @@ class SimpleTracerWidget(QWidget):
 
     def normalization_name(self) -> str:
         mode = self.norm_combo.currentText()
-        if mode in {"dF/F0", "-dF/F0", "SNR(-dF/F0)"}:
-            return f"{mode} F0={self.f0_spin.value()}%"
+        signal = "-dF/F0" if self.negative_signal_checkbox.isChecked() else "dF/F0"
+        if mode == "dF/F0":
+            return f"{signal} F0={self.f0_spin.value()}%"
+        if mode == "SNR(dF/F0)":
+            return f"SNR({signal}) F0={self.f0_spin.value()}%"
+        if mode == "FRAME_SNR":
+            direction = "valley" if self.negative_signal_checkbox.isChecked() else "peak"
+            return f"{mode} ({direction})"
         return mode
 
     def normalize_trace(self, trace: np.ndarray) -> np.ndarray:
-        mode = self.norm_combo.currentText()
-        trace = np.asarray(trace, dtype=float)
-        if mode == "FRAME_SNR":
-            return self.frame_processed_trace(trace)["snr_trace"]
-        if mode in {"dF/F0", "-dF/F0", "SNR(-dF/F0)"}:
-            f0 = np.percentile(trace, self.f0_spin.value())
-            normalized = (trace - f0) / f0 if f0 else np.zeros_like(trace)
-            negative = -normalized
-            if mode == "-dF/F0":
-                return negative
-            if mode == "SNR(-dF/F0)":
-                baseline = np.median(negative)
-                noise = 1.4826 * np.median(np.abs(negative - baseline))
-                return (negative - baseline) / noise if noise else np.zeros_like(trace)
-            return normalized
-        if mode == "Z-score":
-            std = trace.std()
-            return (trace - trace.mean()) / std if std else np.zeros_like(trace)
-        if mode == "Min-max":
-            span = trace.max() - trace.min()
-            return (trace - trace.min()) / span if span else np.zeros_like(trace)
-        return trace
+        return normalize_activity_trace(
+            trace,
+            self.norm_combo.currentText(),
+            self.f0_spin.value(),
+            self.frame_settings(),
+        )
 
     def traced_states(self) -> list[MovieState]:
         states = []
@@ -841,11 +946,46 @@ class SimpleTracerWidget(QWidget):
         for state in states:
             self.roi_check_layout.addWidget(QLabel(state.layer_name))
             for roi in sorted(state.traces):
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
                 checkbox = QCheckBox(f"ROI {roi}")
                 checkbox.setChecked(roi in state.visible_rois)
                 checkbox.toggled.connect(partial(self.set_roi_visibility, state, roi))
-                self.roi_check_layout.addWidget(checkbox)
+                color_block = QLabel()
+                color_block.setFixedSize(18, 18)
+                color_button = QPushButton()
+                color_button.setFixedWidth(90)
+                color_button.clicked.connect(
+                    partial(self.choose_trace_color, state, roi, color_block, color_button)
+                )
+                self.update_trace_color_widgets(color_block, color_button, state.trace_colors[roi])
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                row_layout.addWidget(color_block)
+                row_layout.addWidget(color_button)
+                self.roi_check_layout.addWidget(row)
         self.roi_check_layout.addStretch()
+
+    def choose_trace_color(
+        self,
+        state: MovieState,
+        roi: int,
+        block: QLabel,
+        button: QPushButton,
+        _checked: bool = False,
+    ) -> None:
+        color = QColorDialog.getColor(QColor(state.trace_colors[roi]), self, f"Color for ROI {roi}")
+        if not color.isValid():
+            return
+        state.trace_colors[roi] = color.name()
+        self.update_trace_color_widgets(block, button, color.name())
+        self.redraw_plot()
+
+    @staticmethod
+    def update_trace_color_widgets(block: QLabel, button: QPushButton, color: str) -> None:
+        block.setStyleSheet(f"background-color: {color}; border: 1px solid #808080;")
+        button.setText(color.upper())
 
     def set_roi_visibility(self, state: MovieState, roi: int, checked: bool) -> None:
         if checked:

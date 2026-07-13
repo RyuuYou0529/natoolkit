@@ -1,1 +1,1 @@
-
+"""Activity tracer package."""

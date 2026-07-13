@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-activity-tracer = "natoolkit.tools.activity_tracer.activity_tracer:main"
+activity-tracer = "natoolkit.tools.activity_tracer.gui:main"
 
 [project.entry-points."napari.manifest"]
 natoolkit = "natoolkit:napari.yaml"

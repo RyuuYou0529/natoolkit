@@ -4,10 +4,10 @@ contributions:
   commands:
     - id: natoolkit.clear_workspace
       title: Clear Workspace
-      python_name: natoolkit.tools.activity_tracer.activity_tracer:ClearWorkspaceDockWidget
+      python_name: natoolkit.tools.activity_tracer.gui:ClearWorkspaceDockWidget
     - id: natoolkit.activity_tracer
       title: ActivityTracer
-      python_name: natoolkit.tools.activity_tracer.activity_tracer:ActivityTracerDockWidget
+      python_name: natoolkit.tools.activity_tracer.gui:ActivityTracerDockWidget
   widgets:
     - command: natoolkit.clear_workspace
       display_name: Clear Workspace
