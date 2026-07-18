@@ -8,6 +8,8 @@ import numpy as np
 @dataclass
 class ROISet:
     labels: np.ndarray
+    submitted_ids: set[int] = field(default_factory=set)
+    active_label: int = 1
 
 
 @dataclass

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
 import napari
 import numpy as np
-from napari.layers import Image, Labels
-from qtpy.QtCore import QTimer
-from qtpy.QtGui import QColor
+from napari.layers import Image, Labels, Points
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +19,8 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -33,7 +36,38 @@ from .processing import (
     normalize_trace as normalize_activity_trace,
     process_frame_trace,
 )
-from .roi import roi_ids
+from .roi import ROILabels, roi_centers, roi_colormap, roi_ids
+
+
+class ROIManagerWidget(QWidget):
+    def __init__(self, select_roi: Callable[[int], None]) -> None:
+        super().__init__()
+        self.select_roi = select_roi
+        self.list_widget = QListWidget()
+        self.list_widget.itemClicked.connect(self._select_item)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.list_widget)
+        self.setMinimumSize(180, 280)
+
+    def set_rois(
+        self,
+        ids: list[int],
+        colors: dict[int, np.ndarray],
+        selected: int,
+    ) -> None:
+        self.list_widget.clear()
+        for roi_id in ids:
+            color = colors[roi_id]
+            pixmap = QPixmap(14, 14)
+            pixmap.fill(QColor.fromRgbF(*(float(value) for value in color[:3])))
+            item = QListWidgetItem(QIcon(pixmap), f"ROI {roi_id}")
+            item.setData(Qt.ItemDataRole.UserRole, roi_id)
+            self.list_widget.addItem(item)
+            if roi_id == selected:
+                self.list_widget.setCurrentItem(item)
+
+    def _select_item(self, item: QListWidgetItem) -> None:
+        self.select_roi(int(item.data(Qt.ItemDataRole.UserRole)))
 
 
 class SimpleTracerWidget(QWidget):
@@ -44,6 +78,7 @@ class SimpleTracerWidget(QWidget):
         self.viewer = viewer
         self.movie_states: dict[int, MovieState] = {}
         self.roi_layer: Labels | None = None
+        self.roi_ids_layer: Points | None = None
         self.shared_roi_set: ROISet | None = None
         self.roi_target_movie: Image | None = None
         self.roi_reference_movie: Image | None = None
@@ -56,9 +91,15 @@ class SimpleTracerWidget(QWidget):
         self.spatial_ref_shape: tuple[int, int] | None = None
         self.temporal_ref_name: str | None = None
         self.temporal_ref_length: int | None = None
+        self.roi_colors = roi_colormap()
+        self.roi_manager = ROIManagerWidget(self.select_roi_from_manager)
+        self.roi_manager_dock = None
 
         self.plot = plot
         self._build_ui()
+        self.roi_feedback_timer = QTimer(self)
+        self.roi_feedback_timer.setSingleShot(True)
+        self.roi_feedback_timer.timeout.connect(self.reset_roi_feedback)
         self._connect_events()
         self.sync_from_selection()
         self.refresh_roi_targets()
@@ -165,6 +206,13 @@ class SimpleTracerWidget(QWidget):
         roi_file_row.addWidget(load_roi_button)
         roi_file_row.addWidget(save_roi_button)
         roi_layout.addLayout(roi_file_row)
+        self.roi_count_label = QLabel("ROIs: 0")
+        self.roi_action_label = QLabel("Drawing ROI 1")
+        open_manager_button = QPushButton("Open ROI Manager")
+        open_manager_button.clicked.connect(lambda _=False: self.open_roi_manager())
+        roi_layout.addWidget(self.roi_count_label)
+        roi_layout.addWidget(self.roi_action_label)
+        roi_layout.addWidget(open_manager_button)
         self.unique_roi_widgets = [
             target_label,
             self.roi_target_combo,
@@ -340,6 +388,15 @@ class SimpleTracerWidget(QWidget):
         )
 
     def sync_from_selection(self, event=None) -> None:
+        ids_layer = self.current_roi_ids_layer()
+        if (
+            ids_layer is not None
+            and self.viewer.layers.selection.active is ids_layer
+        ):
+            layer = self.current_roi_layer()
+            if layer is not None:
+                self.viewer.layers.selection.active = layer
+            return
         active = self.active_image_layer()
         target_changed = active is not None and active is not self.roi_target_movie
         if target_changed and self.roi_mode_name == "Unique":
@@ -378,6 +435,7 @@ class SimpleTracerWidget(QWidget):
         self.syncing = False
         if target_changed and self.roi_mode_name == "Unique":
             self.reload_roi_layer()
+        self.refresh_roi_manager()
         self.sync_time_line()
 
     def save_time_roi(self) -> None:
@@ -523,6 +581,13 @@ class SimpleTracerWidget(QWidget):
     def current_roi_layer(self) -> Labels | None:
         return self.roi_layer if self.roi_layer is not None and self.roi_layer in self.viewer.layers else None
 
+    def current_roi_ids_layer(self) -> Points | None:
+        return (
+            self.roi_ids_layer
+            if self.roi_ids_layer is not None and self.roi_ids_layer in self.viewer.layers
+            else None
+        )
+
     def roi_set_for(
         self,
         mode: str | None = None,
@@ -541,6 +606,115 @@ class SimpleTracerWidget(QWidget):
         if state.roi_set is None and create:
             state.roi_set = ROISet(np.zeros(movie.data.shape[-2:], dtype=np.uint16))
         return state.roi_set
+
+    def roi_color(self, roi_id: int) -> np.ndarray:
+        return np.asarray(self.roi_colors.map(roi_id), dtype=float)
+
+    def refresh_roi_manager(self) -> None:
+        roi_set = self.roi_set_for(create=False)
+        ids = sorted(roi_set.submitted_ids) if roi_set is not None else []
+        selected = roi_set.active_label if roi_set is not None else 1
+        colors = {roi_id: self.roi_color(roi_id) for roi_id in ids}
+        self.roi_manager.set_rois(ids, colors, selected)
+        self.roi_count_label.setText(f"ROIs: {len(ids)}")
+        if not self.roi_feedback_timer.isActive():
+            self.roi_action_label.setText(f"Drawing ROI {selected}")
+        if self.roi_manager_dock is not None:
+            title = "Shared ROI Manager"
+            if self.roi_mode_name == "Unique" and self.roi_target_movie is not None:
+                title = f"ROI Manager — {self.roi_target_movie.name}"
+            self.roi_manager_dock.setWindowTitle(title)
+
+    def open_roi_manager(self) -> None:
+        if self.roi_manager_dock is None:
+            self.roi_manager_dock = self.viewer.window.add_dock_widget(
+                self.roi_manager,
+                name="ROI Manager",
+                area="right",
+            )
+            self.roi_manager_dock.setFloating(True)
+        self.refresh_roi_manager()
+        self.roi_manager_dock.show()
+        self.roi_manager_dock.raise_()
+
+    def select_roi_from_manager(self, roi_id: int) -> None:
+        if not self.show_roi_checkbox.isChecked():
+            self.show_roi_checkbox.setChecked(True)
+        layer = self.current_roi_layer()
+        roi_set = self.roi_set_for(create=False)
+        if layer is None or roi_set is None:
+            return
+        roi_set.active_label = roi_id
+        layer.selected_label = roi_id
+        self.viewer.layers.selection.active = layer
+        self.viewer.window._qt_viewer.setFocus()
+        self.refresh_roi_manager()
+
+    def on_roi_label_selected(self, event=None) -> None:
+        layer = self.current_roi_layer()
+        roi_set = self.roi_set_for(create=False)
+        if layer is None or roi_set is None:
+            return
+        roi_set.active_label = int(layer.selected_label)
+        self.refresh_roi_manager()
+
+    def show_roi_feedback(self, text: str, color: str) -> None:
+        self.roi_action_label.setText(text)
+        self.roi_action_label.setStyleSheet(
+            f"QLabel {{ background: {color}; color: black; padding: 4px; }}"
+        )
+        self.roi_feedback_timer.start(900)
+
+    def reset_roi_feedback(self) -> None:
+        self.roi_action_label.setStyleSheet("")
+        self.refresh_roi_manager()
+
+    def reload_roi_ids_layer(self) -> None:
+        if not self.show_roi_checkbox.isChecked():
+            return
+        roi_set = self.roi_set_for(create=False)
+        roi_layer = self.current_roi_layer()
+        if roi_set is None or roi_layer is None:
+            return
+        labels = np.asarray(roi_layer.data)
+        ids = [
+            roi_id
+            for roi_id in sorted(roi_set.submitted_ids)
+            if np.any(labels == roi_id)
+        ]
+        positions = roi_centers(labels, ids)
+        features = {"roi_id": np.asarray(ids, dtype=int)}
+        colors = np.asarray([self.roi_color(roi_id) for roi_id in ids])
+        name = (
+            "Shared ROI IDs"
+            if self.roi_mode_name == "Shared"
+            else f"ROI IDs: {self.roi_target_movie.name}"
+        )
+        layer = self.current_roi_ids_layer()
+        if layer is None:
+            layer = Points(
+                positions,
+                border_color=colors if ids else "white",
+                border_width=0,
+                face_color=[0, 0, 0, 0],
+                features=features,
+                name=name,
+                size=18,
+                text={
+                    "string": "{roi_id}",
+                    "color": "white",
+                    "size": 12,
+                    "anchor": "center",
+                },
+            )
+            layer.editable = False
+            self.roi_ids_layer = layer
+            self.viewer.layers.append(layer)
+        else:
+            layer.data = positions
+            layer.features = features
+            layer.border_color = colors if ids else "white"
+            layer.name = name
 
     def save_roi_layer(
         self,
@@ -575,27 +749,90 @@ class SimpleTracerWidget(QWidget):
         layer = self.current_roi_layer()
         name = "Shared ROIs" if self.roi_mode_name == "Shared" else f"ROIs: {self.roi_target_movie.name}"
         if layer is None:
-            layer = Labels(roi_set.labels.copy(), name=name)
+            layer = ROILabels(
+                roi_set.labels.copy(),
+                colormap=self.roi_colors,
+                name=name,
+                opacity=0.5,
+            )
+            layer.contour = 2
+            layer.preserve_labels = True
+            layer.selected_label = roi_set.active_label
             self.roi_layer = layer
             self.viewer.layers.append(layer)
+            self.bind_roi_shortcuts(layer)
+            layer.events.selected_label.connect(self.on_roi_label_selected)
         else:
             layer.data = roi_set.labels.copy()
             layer.name = name
+            layer.selected_label = roi_set.active_label
+        self.reload_roi_ids_layer()
+        self.viewer.layers.selection.active = layer
+        self.refresh_roi_manager()
+
+    def bind_roi_shortcuts(self, layer: Labels) -> None:
+        @layer.bind_key("T")
+        def submit_roi(active_layer: Labels) -> None:
+            label_id = int(active_layer.selected_label)
+            background = int(active_layer.colormap.background_value)
+            labels = np.asarray(active_layer.data)
+            if label_id == background or not np.any(labels == label_id):
+                self.set_status("Draw an ROI before submitting it.")
+                self.show_roi_feedback(f"ROI {label_id} is empty", "#f4c95d")
+                return
+
+            self.save_roi_layer(layer=active_layer)
+            roi_set = self.roi_set_for()
+            roi_set.submitted_ids.add(label_id)
+            next_label = int(labels.max()) + 1
+            roi_set.active_label = next_label
+            active_layer.selected_label = next_label
+            self.reload_roi_ids_layer()
+            self.refresh_roi_manager()
+            self.set_status(f"Submitted ROI {label_id}. Drawing ROI {next_label}.")
+            self.show_roi_feedback(f"✓ ROI {label_id} submitted", "#7bd88f")
+
+        @layer.bind_key("C")
+        def clear_roi(active_layer: Labels) -> None:
+            label_id = int(active_layer.selected_label)
+            background = int(active_layer.colormap.background_value)
+            labels = np.asarray(active_layer.data)
+            indices = np.nonzero(labels == label_id)
+            if label_id == background or indices[0].size == 0:
+                self.set_status("The selected ROI is already empty.")
+                self.show_roi_feedback(f"ROI {label_id} is empty", "#f4c95d")
+                return
+
+            active_layer.data_setitem(indices, background)
+            self.save_roi_layer(layer=active_layer)
+            roi_set = self.roi_set_for()
+            roi_set.submitted_ids.discard(label_id)
+            roi_set.active_label = label_id
+            self.reload_roi_ids_layer()
+            self.refresh_roi_manager()
+            self.set_status(f"Cleared ROI {label_id}.")
+            self.show_roi_feedback(f"ROI {label_id} cleared", "#f4c95d")
 
     def toggle_roi_layer(self, checked: bool) -> None:
         if checked:
             self.reload_roi_layer()
             return
         layer = self.current_roi_layer()
+        ids_layer = self.current_roi_ids_layer()
         if layer is None:
             return
         self.save_roi_layer()
         self.removing_roi_layer = True
+        if ids_layer is not None:
+            self.viewer.layers.remove(ids_layer)
         self.viewer.layers.remove(layer)
         self.removing_roi_layer = False
 
     def on_layer_removing(self, event) -> None:
         layer = self.viewer.layers[event.index]
+        if layer is self.roi_ids_layer:
+            self.roi_ids_layer = None
+            return
         if isinstance(layer, Image):
             if layer is self.roi_target_movie and self.roi_mode_name == "Unique":
                 self.save_roi_layer(movie=layer)
@@ -639,6 +876,7 @@ class SimpleTracerWidget(QWidget):
         for widget in self.unique_roi_widgets:
             widget.setEnabled(mode == "Unique" and self.roi_target_combo.count() > 0)
         self.reload_roi_layer()
+        self.refresh_roi_manager()
         self.set_status(f"ROI mode changed to {mode}.")
 
     def refresh_roi_targets(self) -> None:
@@ -664,6 +902,7 @@ class SimpleTracerWidget(QWidget):
         self.show_roi_checkbox.setEnabled(bool(movies))
         for widget in self.unique_roi_widgets:
             widget.setEnabled(self.roi_mode_name == "Unique" and bool(movies))
+        self.refresh_roi_manager()
 
     def switch_roi_target(self, index: int) -> None:
         if self.syncing:
@@ -678,6 +917,7 @@ class SimpleTracerWidget(QWidget):
         self.viewer.layers.selection.active = movie
         if self.roi_mode_name == "Unique":
             self.reload_roi_layer()
+        self.refresh_roi_manager()
 
     def set_roi_reference(self) -> None:
         self.save_roi_layer()
@@ -699,11 +939,16 @@ class SimpleTracerWidget(QWidget):
             self.set_status("Reference ROIs must match the target movie Y/X shape.")
             return
         state = self.state_for(target)
-        state.roi_set = ROISet(source.labels.copy())
+        state.roi_set = ROISet(
+            source.labels.copy(),
+            set(source.submitted_ids),
+            source.active_label,
+        )
         state.traces.clear()
         state.visible_rois.clear()
         state.spikes.clear()
         self.reload_roi_layer()
+        self.refresh_roi_manager()
         self.set_status(f"Copied ROIs from {self.roi_reference_movie.name} to {target.name}.")
 
     def roi_labels_for(self, movie: Image) -> np.ndarray | None:
@@ -722,18 +967,21 @@ class SimpleTracerWidget(QWidget):
         if labels.shape != tuple(movie.data.shape[-2:]):
             self.set_status("ROI labels must match the movie Y/X shape.")
             return
+        ids = set(roi_ids(labels))
+        roi_set = ROISet(labels, ids, max(ids, default=0) + 1)
         if self.roi_mode_name == "Shared":
-            self.shared_roi_set = ROISet(labels)
+            self.shared_roi_set = roi_set
             states = self.movie_states.values()
         else:
             state = self.state_for(movie)
-            state.roi_set = ROISet(labels)
+            state.roi_set = roi_set
             states = [state]
         for state in states:
             state.traces.clear()
             state.visible_rois.clear()
             state.spikes.clear()
         self.reload_roi_layer()
+        self.refresh_roi_manager()
         self.set_status(f"ROI labels loaded in {self.roi_mode_name} mode.")
 
     def export_roi_labels(self) -> None:
