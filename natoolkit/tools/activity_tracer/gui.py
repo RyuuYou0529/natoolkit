@@ -393,9 +393,7 @@ class SimpleTracerWidget(QWidget):
             ids_layer is not None
             and self.viewer.layers.selection.active is ids_layer
         ):
-            layer = self.current_roi_layer()
-            if layer is not None:
-                self.viewer.layers.selection.active = layer
+            QTimer.singleShot(0, self.activate_roi_layer)
             return
         active = self.active_image_layer()
         target_changed = active is not None and active is not self.roi_target_movie
@@ -409,6 +407,7 @@ class SimpleTracerWidget(QWidget):
                 self.roi_target_combo.blockSignals(True)
                 self.roi_target_combo.setCurrentIndex(index)
                 self.roi_target_combo.blockSignals(False)
+
         layer = self.current_image_layer()
         self.syncing = True
         if layer is None:
@@ -437,6 +436,11 @@ class SimpleTracerWidget(QWidget):
             self.reload_roi_layer()
         self.refresh_roi_manager()
         self.sync_time_line()
+
+    def activate_roi_layer(self) -> None:
+        layer = self.current_roi_layer()
+        if layer is not None:
+            self.viewer.layers.selection.active = layer
 
     def save_time_roi(self) -> None:
         if self.syncing:
@@ -767,7 +771,7 @@ class SimpleTracerWidget(QWidget):
             layer.name = name
             layer.selected_label = roi_set.active_label
         self.reload_roi_ids_layer()
-        self.viewer.layers.selection.active = layer
+        self.activate_roi_layer()
         self.refresh_roi_manager()
 
     def bind_roi_shortcuts(self, layer: Labels) -> None:
