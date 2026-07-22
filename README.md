@@ -22,4 +22,14 @@ Install from a local checkout:
 pip install -e .
 ```
 
+Install with Suite2p motion correction and ROI detection support:
+
+```bash
+pip install -e ".[suite2p]"
+```
+
 After installation, napari can discover the plugin from the `natoolkit` manifest.
+
+## License
+
+Neural Activity Toolkit is licensed under the GNU General Public License v3.0.

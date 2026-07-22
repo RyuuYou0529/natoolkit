@@ -7,8 +7,10 @@ name = "natoolkit"
 version = "0.1.0"
 description = "Lab tools for neural activity data analysis."
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
+    "dask[array]",
     "matplotlib",
     "napari[pyqt6]",
     "numpy",
@@ -17,6 +19,9 @@ dependencies = [
     "scipy",
     "tifffile",
 ]
+
+[project.optional-dependencies]
+suite2p = ["suite2p>=1.1,<2"]
 
 [project.scripts]
 activity-tracer = "natoolkit.tools.activity_tracer.gui:main"

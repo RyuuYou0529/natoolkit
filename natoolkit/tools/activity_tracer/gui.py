@@ -5,9 +5,11 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
+import dask.array as da
 import napari
 import numpy as np
 from napari.layers import Image, Labels, Points
+from napari.qt.threading import create_worker
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QColor, QIcon, QPixmap
 from qtpy.QtWidgets import (
@@ -21,6 +23,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -28,6 +31,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from .movie_manager import ManagedMovie, MovieManager
 from .models import MovieState, ROISet
 from .plot import ActivityPlot
 from .processing import (
@@ -37,6 +41,14 @@ from .processing import (
     process_frame_trace,
 )
 from .roi import ROILabels, roi_centers, roi_colormap, roi_ids
+from .suite2p_adapter import (
+    MovieInput,
+    ROIDetectionResult,
+    Suite2PSession,
+    run_motion_correction as execute_motion_correction,
+    run_roi_detection as execute_roi_detection,
+)
+from .suite2p_dialogs import MotionCorrectionDialog, ROIDetectionDialog
 
 
 class ROIManagerWidget(QWidget):
@@ -76,7 +88,8 @@ class SimpleTracerWidget(QWidget):
     def __init__(self, viewer: napari.Viewer, plot: ActivityPlot) -> None:
         super().__init__()
         self.viewer = viewer
-        self.movie_states: dict[int, MovieState] = {}
+        self.movie_manager = MovieManager()
+        self.movie_states = self.movie_manager.states
         self.roi_layer: Labels | None = None
         self.roi_ids_layer: Points | None = None
         self.shared_roi_set: ROISet | None = None
@@ -94,6 +107,16 @@ class SimpleTracerWidget(QWidget):
         self.roi_colors = roi_colormap()
         self.roi_manager = ROIManagerWidget(self.select_roi_from_manager)
         self.roi_manager_dock = None
+        self.suite2p_session: Suite2PSession | None = None
+        self.suite2p_worker = None
+        self.suite2p_busy = False
+        self.movie_view_busy = False
+        self.merged_movie_layer: Image | None = None
+        self.merged_movie_keys: tuple[int, ...] = ()
+        self.switching_movie_view = False
+        self.activity_states: list[MovieState] = []
+        self.activity_export_states: list[MovieState] = []
+        self.activity_merged = False
 
         self.plot = plot
         self._build_ui()
@@ -103,6 +126,7 @@ class SimpleTracerWidget(QWidget):
         self._connect_events()
         self.sync_from_selection()
         self.refresh_roi_targets()
+        self.update_suite2p_controls()
         QTimer.singleShot(0, self.reload_roi_layer)
 
     def _build_ui(self) -> None:
@@ -121,11 +145,19 @@ class SimpleTracerWidget(QWidget):
         self.status_label.setWordWrap(True)
         controls_layout.addWidget(self.active_label)
 
-        movie_group = QGroupBox("Movie")
-        movie_layout = QVBoxLayout(movie_group)
-        import_button = QPushButton("Import Movie")
-        import_button.clicked.connect(lambda _=False: self.import_movies())
-        movie_layout.addWidget(import_button)
+        self.movie_group = QGroupBox("Movie")
+        movie_layout = QVBoxLayout(self.movie_group)
+        self.import_button = QPushButton("Import Movie")
+        self.import_button.clicked.connect(lambda _=False: self.import_movies())
+        movie_layout.addWidget(self.import_button)
+        self.motion_correction_button = QPushButton("Motion Correction")
+        self.motion_correction_button.clicked.connect(
+            lambda _=False: self.start_motion_correction()
+        )
+        movie_layout.addWidget(self.motion_correction_button)
+        self.merged_view_checkbox = QCheckBox("Merged view")
+        self.merged_view_checkbox.toggled.connect(self.toggle_merged_view)
+        movie_layout.addWidget(self.merged_view_checkbox)
         self.movie_info_label = QLabel("No selected movie.")
         self.movie_info_label.setWordWrap(True)
         movie_layout.addWidget(self.movie_info_label)
@@ -164,10 +196,10 @@ class SimpleTracerWidget(QWidget):
         self.reference_info_label = QLabel("")
         self.reference_info_label.setWordWrap(True)
         movie_layout.addWidget(self.reference_info_label)
-        controls_layout.addWidget(movie_group)
+        controls_layout.addWidget(self.movie_group)
 
-        roi_group = QGroupBox("ROIs")
-        roi_layout = QVBoxLayout(roi_group)
+        self.roi_group = QGroupBox("ROIs")
+        roi_layout = QVBoxLayout(self.roi_group)
         self.roi_mode_combo = QComboBox()
         self.roi_mode_combo.addItems(["Shared", "Unique"])
         self.roi_mode_combo.currentTextChanged.connect(self.switch_roi_mode)
@@ -175,6 +207,17 @@ class SimpleTracerWidget(QWidget):
         mode_row.addWidget(QLabel("Mode"))
         mode_row.addWidget(self.roi_mode_combo)
         roi_layout.addLayout(mode_row)
+
+        self.roi_detection_button = QPushButton("ROI Detection")
+        self.roi_detection_button.clicked.connect(
+            lambda _=False: self.start_roi_detection()
+        )
+        self.initialize_unique_button = QPushButton("Initialize Unique ROIs from Shared")
+        self.initialize_unique_button.clicked.connect(
+            lambda _=False: self.initialize_unique_rois_from_shared()
+        )
+        roi_layout.addWidget(self.roi_detection_button)
+        roi_layout.addWidget(self.initialize_unique_button)
 
         self.show_roi_checkbox = QCheckBox("Show ROI layer")
         self.show_roi_checkbox.setChecked(False)
@@ -222,7 +265,7 @@ class SimpleTracerWidget(QWidget):
         ]
         for widget in self.unique_roi_widgets:
             widget.setEnabled(False)
-        controls_layout.addWidget(roi_group)
+        controls_layout.addWidget(self.roi_group)
 
         trace_group = QGroupBox("Activities")
         trace_layout = QVBoxLayout(trace_group)
@@ -345,15 +388,7 @@ class SimpleTracerWidget(QWidget):
         return self.active_image_layer() or self.selected_movie
 
     def state_for(self, layer: Image) -> MovieState:
-        key = id(layer)
-        if key not in self.movie_states:
-            self.movie_states[key] = MovieState()
-        state = self.movie_states[key]
-        if state.source_data is None:
-            state.source_data = layer.data
-            state.stop = int(layer.data.shape[0])
-        state.layer_name = layer.name
-        return state
+        return self.movie_manager.state_for(layer)
 
     def update_movie_info(self, layer: Image | None) -> None:
         if layer is None:
@@ -565,6 +600,10 @@ class SimpleTracerWidget(QWidget):
         self.update_movie_info(layer)
 
     def import_movies(self) -> None:
+        if self.merged_view_checkbox.isChecked():
+            self.merged_view_checkbox.setChecked(False)
+            QTimer.singleShot(0, self.import_movies)
+            return
         paths, _ = QFileDialog.getOpenFileNames(self, "Open movie")
         if not paths:
             return
@@ -577,10 +616,439 @@ class SimpleTracerWidget(QWidget):
                 opened = self.viewer.open(str(path), layer_type="image")
                 last_layer = opened[0]
                 last_layer.name = path.stem
-            self.state_for(last_layer)
+            self.movie_manager.mark_imported(last_layer, path)
         self.viewer.layers.selection.active = last_layer
         self.sync_from_selection()
         self.refresh_roi_targets()
+        self.update_suite2p_controls()
+
+    def suite2p_movie_inputs(self) -> list[MovieInput]:
+        return [
+            MovieInput(
+                key=record.key,
+                name=record.layer.name,
+                data=record.motion_input,
+                source_path=record.source_path,
+            )
+            for record in self.ordered_imported_movies()
+        ]
+
+    def ordered_imported_movies(self) -> list[ManagedMovie]:
+        records = self.movie_manager.records
+        return [
+            records[id(layer)]
+            for layer in self.viewer.layers
+            if isinstance(layer, Image)
+            and id(layer) in records
+            and records[id(layer)].imported
+        ]
+
+    def session_matches_imported_movies(self) -> bool:
+        if self.suite2p_session is None:
+            return False
+        imported_keys = {record.key for record in self.movie_manager.imported_movies()}
+        return set(self.suite2p_session.movie_keys) == imported_keys
+
+    def default_suite2p_output(self) -> Path:
+        movies = self.ordered_imported_movies()
+        if movies and movies[0].source_path is not None:
+            return movies[0].source_path.parent
+        return Path.cwd()
+
+    def has_existing_rois(self) -> bool:
+        if self.shared_roi_set is not None and (
+            self.shared_roi_set.submitted_ids or np.any(self.shared_roi_set.labels)
+        ):
+            return True
+        return any(
+            record.state.roi_set is not None
+            and (
+                record.state.roi_set.submitted_ids
+                or np.any(record.state.roi_set.labels)
+            )
+            for record in self.movie_manager.imported_movies()
+        )
+
+    def start_motion_correction(self) -> None:
+        if self.suite2p_busy:
+            return
+        inputs = self.suite2p_movie_inputs()
+        if not inputs:
+            self.set_status("Import movies through Activity Tracer before motion correction.")
+            return
+        dialog = MotionCorrectionDialog(self.default_suite2p_output(), self)
+        if not dialog.exec():
+            return
+        output_root, parameters = dialog.values()
+        suite2p_dir = output_root.expanduser().resolve() / "suite2p"
+        replace_existing = suite2p_dir.exists() and any(suite2p_dir.iterdir())
+        if replace_existing:
+            answer = QMessageBox.warning(
+                self,
+                "Replace existing Suite2p results?",
+                f"{suite2p_dir} already contains results. They will be permanently "
+                "deleted and cannot be recovered. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if self.has_existing_rois():
+            answer = QMessageBox.question(
+                self,
+                "Replace existing ROIs?",
+                "Motion correction changes pixel coordinates. Existing ROIs and traces "
+                "for imported movies will be cleared for this run.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        if (
+            replace_existing
+            and self.suite2p_session is not None
+            and self.suite2p_session.suite2p_dir.resolve() == suite2p_dir
+        ):
+            self.discard_current_suite2p_session()
+
+        self._set_suite2p_busy(True)
+        self.set_status("Running Suite2p motion correction...")
+        worker = create_worker(
+            execute_motion_correction,
+            inputs,
+            output_root,
+            parameters,
+            replace_existing,
+            _start_thread=False,
+            _progress={"desc": "Suite2p motion correction"},
+            _ignore_errors=True,
+        )
+        worker.returned.connect(self.on_motion_correction_complete)
+        worker.errored.connect(self.on_suite2p_error)
+        worker.finished.connect(self.on_suite2p_finished)
+        self.suite2p_worker = worker
+        worker.start()
+
+    def discard_current_suite2p_session(self) -> None:
+        if self.show_roi_checkbox.isChecked():
+            self.show_roi_checkbox.setChecked(False)
+        self.shared_roi_set = None
+        for record in self.movie_manager.imported_movies():
+            state = self.movie_manager.restore_motion_input(record.layer)
+            state.roi_set = None
+            state.traces.clear()
+            state.visible_rois.clear()
+            state.spikes.clear()
+        self.suite2p_session = None
+
+    def on_motion_correction_complete(self, session: Suite2PSession) -> None:
+        if session.movie_keys != tuple(
+            record.key for record in self.ordered_imported_movies()
+        ):
+            self.set_status(
+                "Movie layers or their order changed during motion correction; "
+                "results were not applied."
+            )
+            return
+
+        self.suite2p_session = session
+        self.shared_roi_set = None
+        for state in self.movie_states.values():
+            state.traces.clear()
+            state.visible_rois.clear()
+            state.spikes.clear()
+        for record in self.movie_manager.imported_movies():
+            data = session.registered_movie(record.key)
+            state = self.movie_manager.apply_registered_data(record.layer, data)
+            state.roi_set = None
+            state.stop = min(state.stop, data.shape[0])
+            record.layer.data = data[state.start : state.stop]
+
+        if self.show_roi_checkbox.isChecked():
+            self.reload_roi_layer()
+        self.sync_from_selection()
+        self.refresh_roi_targets()
+        self.update_suite2p_controls()
+        metric_status = (
+            " Registration metrics were saved."
+            if "regDX" in session.reg_outputs
+            else " Registration metrics require at least 1500 combined frames."
+        )
+        self.set_status(
+            f"Motion-corrected {len(session.movie_keys)} movies. "
+            f"Suite2p outputs: {session.suite2p_dir}.{metric_status}"
+        )
+
+    def start_roi_detection(self) -> None:
+        if self.suite2p_busy:
+            return
+        if self.roi_mode_name != "Shared":
+            self.set_status("Switch to Shared mode before Suite2p ROI detection.")
+            return
+        session = self.suite2p_session
+        if session is None or not self.session_matches_imported_movies():
+            self.set_status("Run motion correction for the current imported movies first.")
+            return
+        dialog = ROIDetectionDialog(self)
+        if not dialog.exec():
+            return
+        if self.shared_roi_set is not None and (
+            self.shared_roi_set.submitted_ids or np.any(self.shared_roi_set.labels)
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Replace shared ROIs?",
+                "Suite2p candidates will replace the current shared ROIs.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self._set_suite2p_busy(True)
+        self.set_status("Running Suite2p ROI detection...")
+        worker = create_worker(
+            execute_roi_detection,
+            session,
+            dialog.values(),
+            _start_thread=False,
+            _progress={"desc": "Suite2p ROI detection"},
+            _ignore_errors=True,
+        )
+        worker.returned.connect(self.on_roi_detection_complete)
+        worker.errored.connect(self.on_suite2p_error)
+        worker.finished.connect(self.on_suite2p_finished)
+        self.suite2p_worker = worker
+        worker.start()
+
+    def on_roi_detection_complete(self, result: ROIDetectionResult) -> None:
+        active_label = max(result.roi_ids, default=0) + 1
+        self.shared_roi_set = ROISet(result.labels, set(result.roi_ids), active_label)
+        for state in self.movie_states.values():
+            state.traces.clear()
+            state.visible_rois.clear()
+            state.spikes.clear()
+
+        movies = self.movie_manager.imported_movies()
+        target = self.merged_movie_layer if self.merged_movie_layer is not None else (
+            movies[0].layer if movies else None
+        )
+        if target is not None:
+            self.roi_target_movie = target
+            self.selected_movie = target
+            self.viewer.layers.selection.active = target
+        if not self.show_roi_checkbox.isChecked():
+            self.show_roi_checkbox.setChecked(True)
+        else:
+            self.reload_roi_layer()
+        self.refresh_roi_manager()
+        self.rebuild_roi_controls()
+        self.redraw_plot()
+        self.update_suite2p_controls()
+        self.set_status(
+            f"Imported {len(result.roi_ids)} Suite2p candidate ROIs from {result.stat_path}."
+        )
+
+    def initialize_unique_rois_from_shared(self) -> None:
+        if self.roi_mode_name != "Shared":
+            self.set_status("Switch to Shared mode before initializing unique ROIs.")
+            return
+        self.save_roi_layer(mode="Shared")
+        source = self.shared_roi_set
+        if source is None or not source.submitted_ids:
+            self.set_status("Detect, draw, or load shared ROIs first.")
+            return
+
+        copied = 0
+        skipped = 0
+        for record in self.movie_manager.imported_movies():
+            target = record.state.roi_set
+            has_unique = target is not None and (
+                target.submitted_ids or np.any(target.labels)
+            )
+            if has_unique or source.labels.shape != tuple(record.state.source_data.shape[-2:]):
+                skipped += 1
+                continue
+            record.state.roi_set = ROISet(
+                source.labels.copy(),
+                set(source.submitted_ids),
+                source.active_label,
+            )
+            copied += 1
+
+        if copied:
+            self.roi_mode_combo.setCurrentText("Unique")
+        self.update_suite2p_controls()
+        self.set_status(
+            f"Initialized unique ROIs for {copied} movies; skipped {skipped} with "
+            "existing or incompatible unique ROIs."
+        )
+
+    def _set_suite2p_busy(self, busy: bool) -> None:
+        self.suite2p_busy = busy
+        enabled = not busy and not self.movie_view_busy
+        self.movie_group.setEnabled(enabled)
+        self.roi_group.setEnabled(enabled)
+        if not busy:
+            self.refresh_roi_targets()
+            self.update_suite2p_controls()
+
+    def _set_movie_view_busy(self, busy: bool) -> None:
+        self.movie_view_busy = busy
+        enabled = not busy and not self.suite2p_busy
+        self.movie_group.setEnabled(enabled)
+        self.roi_group.setEnabled(enabled)
+        if not busy:
+            self.refresh_roi_targets()
+            self.update_suite2p_controls()
+
+    def on_suite2p_error(self, error: Exception) -> None:
+        self.set_status(f"Suite2p failed: {error}")
+        QMessageBox.critical(self, "Suite2p failed", str(error))
+
+    def on_suite2p_finished(self) -> None:
+        self.suite2p_worker = None
+        self._set_suite2p_busy(False)
+
+    def update_suite2p_controls(self) -> None:
+        has_movies = bool(self.movie_manager.imported_movies())
+        valid_session = self.session_matches_imported_movies()
+        merged = self.merged_movie_layer is not None
+        has_shared = self.shared_roi_set is not None and bool(
+            self.shared_roi_set.submitted_ids
+        )
+        self.motion_correction_button.setEnabled(
+            has_movies
+            and not merged
+            and not self.suite2p_busy
+            and not self.movie_view_busy
+        )
+        self.merged_view_checkbox.setEnabled(
+            valid_session
+            and self.roi_mode_name == "Shared"
+            and not self.suite2p_busy
+            and not self.movie_view_busy
+        )
+        self.roi_detection_button.setEnabled(
+            valid_session
+            and self.roi_mode_name == "Shared"
+            and not self.suite2p_busy
+            and not self.movie_view_busy
+        )
+        self.initialize_unique_button.setEnabled(
+            has_shared
+            and self.roi_mode_name == "Shared"
+            and not merged
+            and not self.suite2p_busy
+            and not self.movie_view_busy
+        )
+
+    def toggle_merged_view(self, checked: bool) -> None:
+        if self.movie_view_busy:
+            return
+        self._set_movie_view_busy(True)
+        self.set_status(
+            "Building merged view..." if checked else "Restoring separate views..."
+        )
+        QTimer.singleShot(0, lambda: self.apply_movie_view(checked))
+
+    def apply_movie_view(self, merged: bool) -> None:
+        try:
+            if merged:
+                self.show_merged_view()
+            else:
+                self.show_separate_view()
+        finally:
+            self._set_movie_view_busy(False)
+
+    def show_merged_view(self) -> None:
+        if not self.session_matches_imported_movies():
+            self.merged_view_checkbox.blockSignals(True)
+            self.merged_view_checkbox.setChecked(False)
+            self.merged_view_checkbox.blockSignals(False)
+            self.set_status("Run motion correction before enabling merged view.")
+            return
+        records = self.ordered_imported_movies()
+        if not records:
+            return
+        if any(record.state.start >= record.state.stop for record in records):
+            self.merged_view_checkbox.blockSignals(True)
+            self.merged_view_checkbox.setChecked(False)
+            self.merged_view_checkbox.blockSignals(False)
+            self.set_status("Each movie needs a non-empty TimeROI before merging.")
+            return
+
+        self.save_roi_layer()
+        for record in records:
+            record.state.layer_name = record.layer.name
+        self.merged_movie_keys = tuple(record.key for record in records)
+        chunks = [
+            da.from_array(
+                record.state.source_data[record.state.start : record.state.stop],
+                chunks=(
+                    max(1, min(256, record.state.stop - record.state.start)),
+                    *record.state.source_data.shape[-2:],
+                ),
+                asarray=False,
+            )
+            for record in records
+        ]
+        merged_data = da.concatenate(chunks, axis=0)
+
+        self.switching_movie_view = True
+        try:
+            for record in records:
+                self.viewer.layers.remove(record.layer)
+            merged_layer = Image(merged_data, name="Merged registered movies")
+            self.viewer.layers.insert(0, merged_layer)
+        finally:
+            self.switching_movie_view = False
+
+        self.merged_movie_layer = merged_layer
+        self.selected_movie = merged_layer
+        self.roi_target_movie = merged_layer
+        self.viewer.layers.selection.active = merged_layer
+        self.roi_mode_combo.setEnabled(False)
+        self.sync_from_selection()
+        self.refresh_roi_targets()
+        self.update_suite2p_controls()
+        self.set_status(
+            f"Merged {len(records)} movies in the current bottom-to-top layer order."
+        )
+
+    def show_separate_view(self) -> None:
+        merged_layer = self.merged_movie_layer
+        if merged_layer is None:
+            return
+        records = [
+            self.movie_manager.records[key]
+            for key in self.merged_movie_keys
+            if key in self.movie_manager.records
+        ]
+
+        self.switching_movie_view = True
+        try:
+            if merged_layer in self.viewer.layers:
+                self.viewer.layers.remove(merged_layer)
+            self.movie_manager.remove(merged_layer)
+            for index, record in enumerate(records):
+                self.viewer.layers.insert(index, record.layer)
+        finally:
+            self.switching_movie_view = False
+
+        self.merged_movie_layer = None
+        self.merged_movie_keys = ()
+        self.roi_mode_combo.setEnabled(True)
+        target = records[0].layer if records else None
+        self.selected_movie = target
+        self.roi_target_movie = target
+        if target is not None:
+            self.viewer.layers.selection.active = target
+        self.sync_from_selection()
+        self.refresh_roi_targets()
+        self.update_suite2p_controls()
+        self.set_status("Restored separate movie layers.")
 
     def current_roi_layer(self) -> Labels | None:
         return self.roi_layer if self.roi_layer is not None and self.roi_layer in self.viewer.layers else None
@@ -660,6 +1128,8 @@ class SimpleTracerWidget(QWidget):
         if layer is None or roi_set is None:
             return
         roi_set.active_label = int(layer.selected_label)
+        if layer.show_selected_label:
+            self.reload_roi_ids_layer()
         self.refresh_roi_manager()
 
     def show_roi_feedback(self, text: str, color: str) -> None:
@@ -673,7 +1143,7 @@ class SimpleTracerWidget(QWidget):
         self.roi_action_label.setStyleSheet("")
         self.refresh_roi_manager()
 
-    def reload_roi_ids_layer(self) -> None:
+    def reload_roi_ids_layer(self, event=None) -> None:
         if not self.show_roi_checkbox.isChecked():
             return
         roi_set = self.roi_set_for(create=False)
@@ -686,6 +1156,8 @@ class SimpleTracerWidget(QWidget):
             for roi_id in sorted(roi_set.submitted_ids)
             if np.any(labels == roi_id)
         ]
+        if roi_layer.show_selected_label:
+            ids = [roi_id for roi_id in ids if roi_id == roi_layer.selected_label]
         positions = roi_centers(labels, ids)
         features = {"roi_id": np.asarray(ids, dtype=int)}
         colors = np.asarray([self.roi_color(roi_id) for roi_id in ids])
@@ -766,6 +1238,7 @@ class SimpleTracerWidget(QWidget):
             self.viewer.layers.append(layer)
             self.bind_roi_shortcuts(layer)
             layer.events.selected_label.connect(self.on_roi_label_selected)
+            layer.events.show_selected_label.connect(self.reload_roi_ids_layer)
         else:
             layer.data = roi_set.labels.copy()
             layer.name = name
@@ -793,6 +1266,7 @@ class SimpleTracerWidget(QWidget):
             active_layer.selected_label = next_label
             self.reload_roi_ids_layer()
             self.refresh_roi_manager()
+            self.update_suite2p_controls()
             self.set_status(f"Submitted ROI {label_id}. Drawing ROI {next_label}.")
             self.show_roi_feedback(f"✓ ROI {label_id} submitted", "#7bd88f")
 
@@ -814,6 +1288,7 @@ class SimpleTracerWidget(QWidget):
             roi_set.active_label = label_id
             self.reload_roi_ids_layer()
             self.refresh_roi_manager()
+            self.update_suite2p_controls()
             self.set_status(f"Cleared ROI {label_id}.")
             self.show_roi_feedback(f"ROI {label_id} cleared", "#f4c95d")
 
@@ -838,6 +1313,8 @@ class SimpleTracerWidget(QWidget):
             self.roi_ids_layer = None
             return
         if isinstance(layer, Image):
+            if self.switching_movie_view:
+                return
             if layer is self.roi_target_movie and self.roi_mode_name == "Unique":
                 self.save_roi_layer(movie=layer)
             return
@@ -852,23 +1329,26 @@ class SimpleTracerWidget(QWidget):
 
     def on_layer_inserted(self, event) -> None:
         layer = event.value
-        if not isinstance(layer, Image):
+        if not isinstance(layer, Image) or self.switching_movie_view:
             return
         self.state_for(layer)
         if self.roi_target_movie is None:
             self.roi_target_movie = layer
         self.refresh_roi_targets()
+        self.update_suite2p_controls()
         if self.show_roi_checkbox.isChecked() and self.current_roi_layer() is None:
             QTimer.singleShot(0, self.reload_roi_layer)
 
     def on_layer_removed(self, event) -> None:
         layer = event.value
-        if not isinstance(layer, Image):
+        if not isinstance(layer, Image) or self.switching_movie_view:
             return
         previous_target = self.roi_target_movie
         if layer is self.selected_movie:
             self.selected_movie = self.active_image_layer()
+        self.movie_manager.remove(layer)
         self.refresh_roi_targets()
+        self.update_suite2p_controls()
         if previous_target is not self.roi_target_movie and self.roi_mode_name == "Unique":
             QTimer.singleShot(0, self.reload_roi_layer)
 
@@ -881,6 +1361,7 @@ class SimpleTracerWidget(QWidget):
             widget.setEnabled(mode == "Unique" and self.roi_target_combo.count() > 0)
         self.reload_roi_layer()
         self.refresh_roi_manager()
+        self.update_suite2p_controls()
         self.set_status(f"ROI mode changed to {mode}.")
 
     def refresh_roi_targets(self) -> None:
@@ -986,6 +1467,7 @@ class SimpleTracerWidget(QWidget):
             state.spikes.clear()
         self.reload_roi_layer()
         self.refresh_roi_manager()
+        self.update_suite2p_controls()
         self.set_status(f"ROI labels loaded in {self.roi_mode_name} mode.")
 
     def export_roi_labels(self) -> None:
@@ -1004,6 +1486,29 @@ class SimpleTracerWidget(QWidget):
 
     def extract_all_movies(self) -> None:
         self.save_roi_layer()
+        if self.merged_movie_layer is not None:
+            records = [
+                self.movie_manager.records[key]
+                for key in self.merged_movie_keys
+                if key in self.movie_manager.records
+            ]
+            results = [(record, self.trace_record(record)) for record in records]
+            completed = [(record, count) for record, count in results if count is not None]
+            failed = [record.state.layer_name for record, count in results if count is None]
+            export_states = [record.state for record, _count in completed]
+            if export_states:
+                merged_state = self.merge_activity_states(export_states)
+                self.activity_states = [merged_state]
+                self.activity_export_states = export_states
+                self.activity_merged = True
+                completed = [(merged_state, len(merged_state.traces))]
+            else:
+                self.activity_states = []
+                self.activity_export_states = []
+                self.activity_merged = False
+            self.finish_activity_extraction(completed, failed)
+            return
+
         movies = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
         if not movies:
             self.set_status("Import movies before extracting activities.")
@@ -1011,10 +1516,42 @@ class SimpleTracerWidget(QWidget):
         results = [(layer, self.trace_movie(layer)) for layer in movies]
         completed = [(layer, count) for layer, count in results if count is not None]
         failed = [layer.name for layer, count in results if count is None]
+        self.activity_states = [self.state_for(layer) for layer, _count in completed]
+        self.activity_export_states = list(self.activity_states)
+        self.activity_merged = False
+        self.finish_activity_extraction(completed, failed)
+
+    def merge_activity_states(self, states: list[MovieState]) -> MovieState:
+        common_rois = set(states[0].traces)
+        for state in states[1:]:
+            common_rois.intersection_update(state.traces)
+
+        merged = MovieState(
+            stop=sum(state.stop - state.start for state in states),
+            layer_name="Merged registered movies",
+        )
+        merged.traces = {
+            roi: np.concatenate([state.traces[roi] for state in states])
+            for roi in sorted(common_rois)
+        }
+        merged.trace_colors = {
+            roi: states[0].trace_colors[roi]
+            for roi in merged.traces
+        }
+        merged.visible_rois = set(merged.traces)
+        return merged
+
+    def finish_activity_extraction(self, completed: list, failed: list[str]) -> None:
         self.rebuild_roi_controls()
         self.redraw_plot()
         total = sum(count for _, count in completed)
-        message = f"Extracted {total} ROI traces from {len(completed)} movies."
+        if self.activity_merged:
+            message = (
+                f"Extracted {total} merged ROI traces from "
+                f"{len(self.activity_export_states)} movies."
+            )
+        else:
+            message = f"Extracted {total} ROI traces from {len(completed)} movies."
         if failed:
             message += f" Skipped: {', '.join(failed)}."
         self.set_status(message)
@@ -1023,16 +1560,35 @@ class SimpleTracerWidget(QWidget):
         self.save_roi_layer()
         state = self.state_for(layer)
         labels = self.roi_labels_for(layer)
+        return self.trace_state(state, np.asarray(layer.data), labels, visible_rois)
+
+    def trace_record(
+        self,
+        record: ManagedMovie,
+        visible_rois: set[int] | None = None,
+    ) -> int | None:
+        state = record.state
+        roi_set = self.shared_roi_set if self.roi_mode_name == "Shared" else state.roi_set
+        labels = None if roi_set is None else roi_set.labels
+        movie = np.asarray(state.source_data[state.start : state.stop])
+        return self.trace_state(state, movie, labels, visible_rois)
+
+    def trace_state(
+        self,
+        state: MovieState,
+        movie: np.ndarray,
+        labels: np.ndarray | None,
+        visible_rois: set[int] | None = None,
+    ) -> int | None:
         if labels is None:
             self.set_status("Create, copy, or load ROI labels first.")
             return None
         if state.start >= state.stop:
             self.set_status("TimeROI is empty. Set Start smaller than Stop.")
             return None
-        if labels.shape != tuple(layer.data.shape[-2:]):
+        if labels.shape != tuple(movie.shape[-2:]):
             self.set_status("ROI labels must match the movie Y/X shape.")
             return None
-        movie = np.asarray(layer.data)
         ids = roi_ids(labels)
         flat_movie = movie.reshape(movie.shape[0], -1)
         flat_labels = labels.reshape(-1)
@@ -1057,7 +1613,11 @@ class SimpleTracerWidget(QWidget):
         if layer is None:
             self.set_status("Select a movie layer first.")
             return
-        state = self.state_for(layer)
+        state = (
+            self.activity_states[0]
+            if self.activity_merged and self.activity_states
+            else self.state_for(layer)
+        )
         if not state.traces:
             self.set_status("Extract activities before detecting spikes.")
             return
@@ -1093,6 +1653,8 @@ class SimpleTracerWidget(QWidget):
 
     def change_signal_polarity(self, _checked: bool) -> None:
         for state in self.movie_states.values():
+            state.spikes.clear()
+        for state in self.activity_states:
             state.spikes.clear()
         self.redraw_plot()
 
@@ -1136,7 +1698,7 @@ class SimpleTracerWidget(QWidget):
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["movie", "roi", "frame", "source_frame", "mean_intensity", "normalization", "normalized"])
-            for state in self.traced_states():
+            for state in self.activity_export_states:
                 for roi, trace in sorted(state.traces.items()):
                     normalized = self.normalize_trace(trace)
                     for offset, value in enumerate(trace):
@@ -1174,13 +1736,7 @@ class SimpleTracerWidget(QWidget):
         )
 
     def traced_states(self) -> list[MovieState]:
-        states = []
-        for layer in self.viewer.layers:
-            if isinstance(layer, Image) and id(layer) in self.movie_states:
-                state = self.state_for(layer)
-                if state.traces:
-                    states.append(state)
-        return states
+        return [state for state in self.activity_states if state.traces]
 
     def rebuild_roi_controls(self) -> None:
         while self.roi_check_layout.count():
