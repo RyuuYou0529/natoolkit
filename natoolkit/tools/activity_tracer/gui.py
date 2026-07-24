@@ -47,6 +47,7 @@ from .suite2p_adapter import (
     Suite2PSession,
     run_motion_correction as execute_motion_correction,
     run_roi_detection as execute_roi_detection,
+    run_roi_detection_on_movie as execute_single_movie_roi_detection,
 )
 from .suite2p_dialogs import MotionCorrectionDialog, ROIDetectionDialog
 
@@ -470,6 +471,7 @@ class SimpleTracerWidget(QWidget):
         if target_changed and self.roi_mode_name == "Unique":
             self.reload_roi_layer()
         self.refresh_roi_manager()
+        self.update_suite2p_controls()
         self.sync_time_line()
 
     def activate_roi_layer(self) -> None:
@@ -783,8 +785,8 @@ class SimpleTracerWidget(QWidget):
     def start_roi_detection(self) -> None:
         if self.suite2p_busy:
             return
-        if self.roi_mode_name != "Shared":
-            self.set_status("Switch to Shared mode before Suite2p ROI detection.")
+        if self.roi_mode_name == "Unique":
+            self.start_unique_roi_detection()
             return
         session = self.suite2p_session
         if session is None or not self.session_matches_imported_movies():
@@ -822,6 +824,110 @@ class SimpleTracerWidget(QWidget):
         self.suite2p_worker = worker
         worker.start()
 
+    def start_unique_roi_detection(self) -> None:
+        target = self.roi_target_movie
+        record = (
+            self.movie_manager.records.get(id(target))
+            if target is not None
+            else None
+        )
+        if record is None or len(record.state.source_data.shape) != 3:
+            self.set_status("Select a 3D target movie for Unique ROI detection.")
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Registered movie required",
+            f"Unique ROI detection will not motion-correct {target.name}. "
+            "Continue only if this movie is already registered.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        dialog = ROIDetectionDialog(self)
+        if not dialog.exec():
+            return
+        roi_set = record.state.roi_set
+        if roi_set is not None and (roi_set.submitted_ids or np.any(roi_set.labels)):
+            answer = QMessageBox.question(
+                self,
+                "Replace unique ROIs?",
+                f"Suite2p candidates will replace the Unique ROIs for {target.name}.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        session = self.suite2p_session
+        reuse_registration = (
+            record.motion_corrected
+            and session is not None
+            and record.key in session.frame_ranges
+            and session.registered_file.exists()
+        )
+        if reuse_registration:
+            worker = create_worker(
+                execute_roi_detection,
+                session,
+                dialog.values(),
+                record.key,
+                _start_thread=False,
+                _progress={"desc": "Suite2p ROI detection"},
+                _ignore_errors=True,
+            )
+        else:
+            source_path = record.source_path
+            if source_path is None:
+                layer_path = getattr(getattr(target, "source", None), "path", None)
+                source_path = Path(layer_path) if layer_path else None
+            output_root = (
+                source_path.parent
+                if source_path is not None
+                else Path.cwd()
+            )
+            suite2p_dir = output_root.expanduser().resolve() / "suite2p"
+            replace_existing = suite2p_dir.exists() and any(suite2p_dir.iterdir())
+            if replace_existing:
+                answer = QMessageBox.warning(
+                    self,
+                    "Replace existing Suite2p results?",
+                    f"{suite2p_dir} already contains results. They will be permanently "
+                    "deleted and cannot be recovered. Continue?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            movie = MovieInput(
+                key=record.key,
+                name=target.name,
+                data=record.state.source_data,
+                source_path=source_path,
+            )
+            worker = create_worker(
+                execute_single_movie_roi_detection,
+                movie,
+                output_root,
+                dialog.values(),
+                replace_existing,
+                _start_thread=False,
+                _progress={"desc": "Suite2p ROI detection"},
+                _ignore_errors=True,
+            )
+
+        self._set_suite2p_busy(True)
+        self.set_status(f"Running Suite2p ROI detection for {target.name}...")
+        worker.returned.connect(
+            partial(self.on_unique_roi_detection_complete, record.key)
+        )
+        worker.errored.connect(self.on_suite2p_error)
+        worker.finished.connect(self.on_suite2p_finished)
+        self.suite2p_worker = worker
+        worker.start()
+
     def on_roi_detection_complete(self, result: ROIDetectionResult) -> None:
         active_label = max(result.roi_ids, default=0) + 1
         self.shared_roi_set = ROISet(result.labels, set(result.roi_ids), active_label)
@@ -848,6 +954,42 @@ class SimpleTracerWidget(QWidget):
         self.update_suite2p_controls()
         self.set_status(
             f"Imported {len(result.roi_ids)} Suite2p candidate ROIs from {result.stat_path}."
+        )
+
+    def on_unique_roi_detection_complete(
+        self,
+        movie_key: int,
+        result: ROIDetectionResult,
+    ) -> None:
+        record = self.movie_manager.records.get(movie_key)
+        if record is None:
+            self.set_status(
+                "The target movie was removed during ROI detection; results were not imported."
+            )
+            return
+        active_label = max(result.roi_ids, default=0) + 1
+        record.state.roi_set = ROISet(
+            result.labels,
+            set(result.roi_ids),
+            active_label,
+        )
+        record.state.traces.clear()
+        record.state.visible_rois.clear()
+        record.state.spikes.clear()
+        self.roi_target_movie = record.layer
+        self.selected_movie = record.layer
+        self.viewer.layers.selection.active = record.layer
+        if not self.show_roi_checkbox.isChecked():
+            self.show_roi_checkbox.setChecked(True)
+        else:
+            self.reload_roi_layer()
+        self.refresh_roi_manager()
+        self.rebuild_roi_controls()
+        self.redraw_plot()
+        self.update_suite2p_controls()
+        self.set_status(
+            f"Imported {len(result.roi_ids)} Suite2p candidate ROIs for "
+            f"{record.layer.name} from {result.stat_path}."
         )
 
     def initialize_unique_rois_from_shared(self) -> None:
@@ -915,6 +1057,16 @@ class SimpleTracerWidget(QWidget):
         has_movies = bool(self.movie_manager.imported_movies())
         valid_session = self.session_matches_imported_movies()
         merged = self.merged_movie_layer is not None
+        target_record = (
+            self.movie_manager.records.get(id(self.roi_target_movie))
+            if self.roi_target_movie is not None
+            else None
+        )
+        valid_unique_target = (
+            target_record is not None
+            and len(target_record.state.source_data.shape) == 3
+            and not merged
+        )
         has_shared = self.shared_roi_set is not None and bool(
             self.shared_roi_set.submitted_ids
         )
@@ -931,8 +1083,11 @@ class SimpleTracerWidget(QWidget):
             and not self.movie_view_busy
         )
         self.roi_detection_button.setEnabled(
-            valid_session
-            and self.roi_mode_name == "Shared"
+            (
+                valid_session
+                if self.roi_mode_name == "Shared"
+                else valid_unique_target
+            )
             and not self.suite2p_busy
             and not self.movie_view_busy
         )
@@ -1403,6 +1558,7 @@ class SimpleTracerWidget(QWidget):
         if self.roi_mode_name == "Unique":
             self.reload_roi_layer()
         self.refresh_roi_manager()
+        self.update_suite2p_controls()
 
     def set_roi_reference(self) -> None:
         self.save_roi_layer()

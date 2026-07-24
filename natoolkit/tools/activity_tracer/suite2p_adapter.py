@@ -292,6 +292,7 @@ def labels_from_stats(
 def run_roi_detection(
     session: Suite2PSession,
     parameters: ROIDetectionParameters,
+    movie_key: int | None = None,
 ) -> ROIDetectionResult:
     suite2p, torch = _load_suite2p()
     settings = deepcopy(session.settings)
@@ -317,12 +318,20 @@ def run_roi_detection(
             "spatial_scale": parameters.spatial_scale,
         }
     )
-    registered = np.memmap(
-        session.registered_file,
-        dtype=np.int16,
-        mode="r",
-        shape=session.shape,
-    )
+    if movie_key is None:
+        registered = np.memmap(
+            session.registered_file,
+            dtype=np.int16,
+            mode="r",
+            shape=session.shape,
+        )
+        badframes = session.reg_outputs.get("badframes")
+    else:
+        registered = session.registered_movie(movie_key)
+        start, stop = session.frame_ranges[movie_key]
+        badframes = session.reg_outputs.get("badframes")
+        if badframes is not None:
+            badframes = badframes[start:stop]
     detect_outputs, stats, _redcell = suite2p.detection_wrapper(
         registered,
         diameter=list(parameters.diameter),
@@ -330,7 +339,7 @@ def run_roi_detection(
         fs=parameters.fs,
         yrange=session.reg_outputs.get("yrange"),
         xrange=session.reg_outputs.get("xrange"),
-        badframes=session.reg_outputs.get("badframes"),
+        badframes=badframes,
         preclassify=0.0,
         settings=settings["detection"],
         device=device,
@@ -344,5 +353,70 @@ def run_roi_detection(
         session.plane_dir / "ops.npy",
         {**session.db, **settings, **session.reg_outputs, **detect_outputs},
     )
-    labels, ids = labels_from_stats(stats, session.shape[-2:])
+    labels, ids = labels_from_stats(stats, registered.shape[-2:])
     return ROIDetectionResult(labels=labels, roi_ids=ids, stat_path=stat_path)
+
+
+def run_roi_detection_on_movie(
+    movie: MovieInput,
+    output_root: Path,
+    parameters: ROIDetectionParameters,
+    replace_existing: bool = False,
+) -> ROIDetectionResult:
+    suite2p, _torch = _load_suite2p()
+    frame_count, height, width = _validate_movies([movie])
+    suite2p_dir, plane_dir = _prepare_output(output_root, replace_existing)
+    registered_file = plane_dir / "data.bin"
+    registered = np.memmap(
+        registered_file,
+        dtype=np.int16,
+        mode="w+",
+        shape=(frame_count, height, width),
+    )
+    for start in range(0, frame_count, 100):
+        stop = min(start + 100, frame_count)
+        registered[start:stop] = _int16_frames(movie.data[start:stop])
+    registered.flush()
+    del registered
+
+    settings = suite2p.default_settings()
+    settings["run"]["do_registration"] = False
+    settings["run"]["do_detection"] = True
+    settings["run"]["do_deconvolution"] = False
+    source_path = str(movie.source_path) if movie.source_path is not None else ""
+    db = {
+        "data_path": [str(movie.source_path.parent)] if movie.source_path else [],
+        "file_list": [source_path] if source_path else [],
+        "save_path0": str(output_root.expanduser().resolve()),
+        "save_folder": "suite2p",
+        "save_path": str(plane_dir),
+        "reg_file": str(registered_file),
+        "nplanes": 1,
+        "nchannels": 1,
+        "keep_movie_raw": False,
+        "nframes": frame_count,
+        "Ly": height,
+        "Lx": width,
+        "frames_per_file": np.asarray([frame_count], dtype=int),
+        "activity_tracer_movies": [movie.name],
+        "activity_tracer_movie_keys": [movie.key],
+    }
+    np.save(suite2p_dir / "db.npy", db)
+    np.save(suite2p_dir / "settings.npy", settings)
+    np.save(plane_dir / "db.npy", db)
+    np.save(plane_dir / "settings.npy", settings)
+    np.save(plane_dir / "ops.npy", {**db, **settings})
+
+    session = Suite2PSession(
+        output_root=output_root.expanduser().resolve(),
+        suite2p_dir=suite2p_dir,
+        plane_dir=plane_dir,
+        registered_file=registered_file,
+        movie_keys=(movie.key,),
+        frame_ranges={movie.key: (0, frame_count)},
+        shape=(frame_count, height, width),
+        reg_outputs={},
+        settings=settings,
+        db=db,
+    )
+    return run_roi_detection(session, parameters, movie.key)
