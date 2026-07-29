@@ -18,6 +18,7 @@ class MovieState:
     stop: int = 0
     layer_name: str = ""
     source_data: np.ndarray | None = None
+    display_spatial_shape: tuple[int, int] | None = None
     spatial_reference: str = ""
     temporal_reference: str = ""
     roi_set: ROISet | None = None

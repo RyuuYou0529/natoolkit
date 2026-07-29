@@ -177,20 +177,24 @@ class SimpleTracerWidget(QWidget):
         full_range_button.clicked.connect(lambda _=False: self.use_full_range())
         movie_layout.addWidget(full_range_button)
 
-        spatial_ref_button = QPushButton("Set Spatial Center Pad Ref")
-        pad_button = QPushButton("Apply Pad")
-        temporal_ref_button = QPushButton("Set Temporal Center Clip Ref")
-        clip_button = QPushButton("Apply Clip")
+        spatial_ref_button = QPushButton("Set Spatial Center Ref")
+        spatial_align_button = QPushButton("Spatially Align")
+        temporal_ref_button = QPushButton("Set Temporal Center Ref")
+        temporal_align_button = QPushButton("Temporally Align")
         spatial_ref_button.clicked.connect(lambda _=False: self.set_spatial_reference())
-        pad_button.clicked.connect(lambda _=False: self.pad_selected_movie())
+        spatial_align_button.clicked.connect(
+            lambda _=False: self.spatially_align_selected_movies()
+        )
         temporal_ref_button.clicked.connect(lambda _=False: self.set_temporal_reference())
-        clip_button.clicked.connect(lambda _=False: self.clip_selected_movie())
+        temporal_align_button.clicked.connect(
+            lambda _=False: self.temporally_align_selected_movies()
+        )
         spatial_row = QHBoxLayout()
         spatial_row.addWidget(spatial_ref_button, stretch=2)
-        spatial_row.addWidget(pad_button, stretch=1)
+        spatial_row.addWidget(spatial_align_button, stretch=1)
         temporal_row = QHBoxLayout()
         temporal_row.addWidget(temporal_ref_button, stretch=2)
-        temporal_row.addWidget(clip_button, stretch=1)
+        temporal_row.addWidget(temporal_align_button, stretch=1)
         movie_layout.addLayout(spatial_row)
         movie_layout.addLayout(temporal_row)
 
@@ -388,6 +392,14 @@ class SimpleTracerWidget(QWidget):
     def current_image_layer(self) -> Image | None:
         return self.active_image_layer() or self.selected_movie
 
+    def selected_image_layers(self) -> list[Image]:
+        selection = self.viewer.layers.selection
+        return [
+            layer
+            for layer in self.viewer.layers
+            if layer in selection and isinstance(layer, Image)
+        ]
+
     def state_for(self, layer: Image) -> MovieState:
         return self.movie_manager.state_for(layer)
 
@@ -413,7 +425,7 @@ class SimpleTracerWidget(QWidget):
         usage = "Selected uses: none"
         if layer is not None:
             state = self.state_for(layer)
-            spatial = state.spatial_reference or "not padded"
+            spatial = state.spatial_reference or "not aligned"
             temporal = state.temporal_reference or "manual/full range"
             usage = f"Selected uses:\nSpatial: {spatial}\nTemporal: {temporal}"
 
@@ -455,13 +467,17 @@ class SimpleTracerWidget(QWidget):
         else:
             state = self.state_for(layer)
             frame_count = int(state.source_data.shape[0])
-            if state.stop == 0 or state.stop > frame_count:
+            if state.stop == 0 or (
+                not state.temporal_reference and state.stop > frame_count
+            ):
                 state.stop = frame_count
             self.active_label.setText(f"Active movie: {layer.name}")
             self.start_spin.setEnabled(True)
             self.stop_spin.setEnabled(True)
-            self.start_spin.setRange(0, frame_count)
-            self.stop_spin.setRange(0, frame_count)
+            range_start = min(0, state.start)
+            range_stop = max(frame_count, state.stop)
+            self.start_spin.setRange(range_start, range_stop)
+            self.stop_spin.setRange(range_start, range_stop)
             self.start_spin.setValue(state.start)
             self.stop_spin.setValue(state.stop)
             self.rebuild_roi_controls()
@@ -515,7 +531,38 @@ class SimpleTracerWidget(QWidget):
         self.stop_spin.setValue(int(state.source_data.shape[0]))
 
     def apply_time_roi(self, layer: Image, state: MovieState) -> None:
-        layer.data = state.source_data[state.start : state.stop]
+        frame_count = int(state.source_data.shape[0])
+        source_start = max(0, state.start)
+        source_stop = min(frame_count, state.stop)
+        data = state.source_data[source_start:source_stop]
+
+        pad_before = max(0, -state.start)
+        pad_after = max(0, state.stop - frame_count)
+        if pad_before or pad_after:
+            pad_width = [(0, 0)] * data.ndim
+            pad_width[0] = (pad_before, pad_after)
+            data = np.pad(data, pad_width, mode="constant")
+
+        if state.display_spatial_shape is not None:
+            target_y, target_x = state.display_spatial_shape
+            source_y, source_x = data.shape[-2:]
+            y_start = max(0, (source_y - target_y) // 2)
+            x_start = max(0, (source_x - target_x) // 2)
+            data = data[
+                ...,
+                y_start : y_start + min(source_y, target_y),
+                x_start : x_start + min(source_x, target_x),
+            ]
+
+            pad_y = max(0, target_y - data.shape[-2])
+            pad_x = max(0, target_x - data.shape[-1])
+            if pad_y or pad_x:
+                pad_width = [(0, 0)] * data.ndim
+                pad_width[-2] = (pad_y // 2, pad_y - pad_y // 2)
+                pad_width[-1] = (pad_x // 2, pad_x - pad_x // 2)
+                data = np.pad(data, pad_width, mode="constant")
+
+        layer.data = data
         self.viewer.dims.set_current_step(0, 0)
         self.update_movie_info(layer)
 
@@ -528,7 +575,7 @@ class SimpleTracerWidget(QWidget):
         self.spatial_ref_name = layer.name
         self.spatial_ref_shape = tuple(state.source_data.shape[-2:])
         self.update_movie_info(layer)
-        self.set_status(f"Spatial pad reference set to {layer.name}.")
+        self.set_status(f"Spatial reference set to {layer.name}.")
 
     def set_temporal_reference(self) -> None:
         layer = self.active_image_layer()
@@ -538,68 +585,51 @@ class SimpleTracerWidget(QWidget):
         self.temporal_ref_name = layer.name
         self.temporal_ref_length = int(layer.data.shape[0])
         self.update_movie_info(layer)
-        self.set_status(f"Temporal clip reference set to {layer.name}.")
+        self.set_status(f"Temporal reference set to {layer.name}.")
 
-    def pad_selected_movie(self) -> None:
-        layer = self.active_image_layer()
-        if layer is None or self.spatial_ref_shape is None:
-            self.set_status("Select a movie and set a spatial reference first.")
+    def spatially_align_selected_movies(self) -> None:
+        layers = self.selected_image_layers()
+        if not layers or self.spatial_ref_shape is None:
+            self.set_status("Select movie layers and set a spatial reference first.")
             return
-        state = self.state_for(layer)
-        source = state.source_data
+
         target_y, target_x = self.spatial_ref_shape
-        source_y, source_x = source.shape[-2:]
-        if source_y > target_y or source_x > target_x:
-            self.set_status("Selected movie is larger than the spatial reference.")
+        for layer in layers:
+            state = self.state_for(layer)
+            state.display_spatial_shape = self.spatial_ref_shape
+            state.spatial_reference = self.spatial_ref_name or ""
+            self.apply_time_roi(layer, state)
+
+        self.update_movie_info(self.current_image_layer())
+        self.set_status(
+            f"Spatially aligned {len(layers)} selected movie(s) to "
+            f"{target_y} x {target_x}."
+        )
+
+    def temporally_align_selected_movies(self) -> None:
+        layers = self.selected_image_layers()
+        if not layers or self.temporal_ref_length is None:
+            self.set_status("Select movie layers and set a temporal reference first.")
             return
 
-        previous_visible = set(state.visible_rois)
-        should_retrace = bool(state.traces)
-        pad_y = target_y - source_y
-        pad_x = target_x - source_x
-        pad_width = [(0, 0)] * source.ndim
-        pad_width[-2] = (pad_y // 2, pad_y - pad_y // 2)
-        pad_width[-1] = (pad_x // 2, pad_x - pad_x // 2)
-        state.source_data = np.pad(source, pad_width, mode="constant")
-        state.spatial_reference = self.spatial_ref_name or ""
-        self.apply_time_roi(layer, state)
-        self.retrace_after_change(layer, previous_visible, should_retrace)
-        self.set_status(f"Padded {layer.name} to {target_y} x {target_x}.")
+        for layer in layers:
+            state = self.state_for(layer)
+            length = int(state.source_data.shape[0])
+            difference = length - self.temporal_ref_length
+            state.start = (
+                difference // 2
+                if difference >= 0
+                else -((-difference) // 2)
+            )
+            state.stop = state.start + self.temporal_ref_length
+            state.temporal_reference = self.temporal_ref_name or ""
+            self.apply_time_roi(layer, state)
 
-    def clip_selected_movie(self) -> None:
-        layer = self.active_image_layer()
-        if layer is None or self.temporal_ref_length is None:
-            self.set_status("Select a movie and set a temporal reference first.")
-            return
-        state = self.state_for(layer)
-        length = int(state.source_data.shape[0])
-        if length < self.temporal_ref_length:
-            self.set_status("Selected movie is shorter than the temporal reference.")
-            return
-
-        previous_visible = set(state.visible_rois)
-        should_retrace = bool(state.traces)
-        diff = length - self.temporal_ref_length
-        state.start = diff // 2
-        state.stop = length - (diff - state.start)
-        state.temporal_reference = self.temporal_ref_name or ""
-        self.apply_time_roi(layer, state)
-        self.syncing = True
-        self.start_spin.setValue(state.start)
-        self.stop_spin.setValue(state.stop)
-        self.syncing = False
-        self.retrace_after_change(layer, previous_visible, should_retrace)
-        self.set_status(f"Center-clipped {layer.name} to {self.temporal_ref_length} frames.")
-
-    def retrace_after_change(self, layer: Image, previous_visible: set[int], should_retrace: bool) -> None:
-        state = self.state_for(layer)
-        if should_retrace and self.trace_movie(layer, previous_visible) is None:
-            state.traces.clear()
-            state.visible_rois.clear()
-            state.spikes.clear()
-        self.rebuild_roi_controls()
-        self.redraw_plot()
-        self.update_movie_info(layer)
+        self.sync_from_selection()
+        self.set_status(
+            f"Temporally aligned {len(layers)} selected movie(s) to "
+            f"{self.temporal_ref_length} frames."
+        )
 
     def import_movies(self) -> None:
         if self.merged_view_checkbox.isChecked():
@@ -1259,10 +1289,14 @@ class SimpleTracerWidget(QWidget):
                 name="ROI Manager",
                 area="right",
             )
+            self.roi_manager_dock.destroyed.connect(self.clear_roi_manager_dock)
             self.roi_manager_dock.setFloating(True)
         self.refresh_roi_manager()
         self.roi_manager_dock.show()
         self.roi_manager_dock.raise_()
+
+    def clear_roi_manager_dock(self, _object=None) -> None:
+        self.roi_manager_dock = None
 
     def select_roi_from_manager(self, roi_id: int) -> None:
         if not self.show_roi_checkbox.isChecked():
