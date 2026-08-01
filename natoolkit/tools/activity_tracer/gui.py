@@ -93,6 +93,7 @@ class SimpleTracerWidget(QWidget):
         self.movie_states = self.movie_manager.states
         self.roi_layer: Labels | None = None
         self.roi_ids_layer: Points | None = None
+        self.enhanced_mean_layer: Image | None = None
         self.shared_roi_set: ROISet | None = None
         self.roi_target_movie: Image | None = None
         self.roi_reference_movie: Image | None = None
@@ -387,7 +388,11 @@ class SimpleTracerWidget(QWidget):
 
     def active_image_layer(self) -> Image | None:
         layer = self.viewer.layers.selection.active
-        return layer if isinstance(layer, Image) else None
+        return (
+            layer
+            if isinstance(layer, Image) and layer is not self.enhanced_mean_layer
+            else None
+        )
 
     def current_image_layer(self) -> Image | None:
         return self.active_image_layer() or self.selected_movie
@@ -397,7 +402,9 @@ class SimpleTracerWidget(QWidget):
         return [
             layer
             for layer in self.viewer.layers
-            if layer in selection and isinstance(layer, Image)
+            if layer in selection
+            and isinstance(layer, Image)
+            and layer is not self.enhanced_mean_layer
         ]
 
     def state_for(self, layer: Image) -> MovieState:
@@ -773,6 +780,7 @@ class SimpleTracerWidget(QWidget):
             state.visible_rois.clear()
             state.spikes.clear()
         self.suite2p_session = None
+        self.enhanced_mean_layer = None
 
     def on_motion_correction_complete(self, session: Suite2PSession) -> None:
         if session.movie_keys != tuple(
@@ -785,6 +793,7 @@ class SimpleTracerWidget(QWidget):
             return
 
         self.suite2p_session = session
+        self.enhanced_mean_layer = None
         self.shared_roi_set = None
         for state in self.movie_states.values():
             state.traces.clear()
@@ -1195,6 +1204,8 @@ class SimpleTracerWidget(QWidget):
         self.roi_target_movie = merged_layer
         self.viewer.layers.selection.active = merged_layer
         self.roi_mode_combo.setEnabled(False)
+        if self.show_roi_checkbox.isChecked():
+            self.reload_roi_layer()
         self.sync_from_selection()
         self.refresh_roi_targets()
         self.update_suite2p_controls()
@@ -1214,6 +1225,11 @@ class SimpleTracerWidget(QWidget):
 
         self.switching_movie_view = True
         try:
+            if (
+                self.enhanced_mean_layer is not None
+                and self.enhanced_mean_layer in self.viewer.layers
+            ):
+                self.viewer.layers.remove(self.enhanced_mean_layer)
             if merged_layer in self.viewer.layers:
                 self.viewer.layers.remove(merged_layer)
             self.movie_manager.remove(merged_layer)
@@ -1244,6 +1260,22 @@ class SimpleTracerWidget(QWidget):
             if self.roi_ids_layer is not None and self.roi_ids_layer in self.viewer.layers
             else None
         )
+
+    def enhanced_mean_layer_for_roi(self) -> Image | None:
+        if self.merged_movie_layer is None or self.suite2p_session is None:
+            return None
+        mean_image = self.suite2p_session.reg_outputs.get("meanImgE")
+        if mean_image is None:
+            return None
+        if self.enhanced_mean_layer is None:
+            self.enhanced_mean_layer = Image(
+                mean_image,
+                name="Enhanced registered mean",
+                colormap="gray",
+            )
+        elif self.enhanced_mean_layer.data is not mean_image:
+            self.enhanced_mean_layer.data = mean_image
+        return self.enhanced_mean_layer
 
     def roi_set_for(
         self,
@@ -1441,10 +1473,21 @@ class SimpleTracerWidget(QWidget):
             if layer.selected_label != roi_set.active_label:
                 layer.selected_label = roi_set.active_label
         attach_layer = layer not in self.viewer.layers
-        if attach_layer:
-            layer.visible = True
+        mean_layer = self.enhanced_mean_layer_for_roi()
+        attach_mean = mean_layer is not None and mean_layer not in self.viewer.layers
+        if attach_layer or attach_mean:
             with self.viewer.layers.batched_update():
-                self.viewer.layers.append(layer)
+                if attach_mean:
+                    mean_layer.visible = True
+                    index = (
+                        self.viewer.layers.index(layer)
+                        if not attach_layer
+                        else len(self.viewer.layers)
+                    )
+                    self.viewer.layers.insert(index, mean_layer)
+                if attach_layer:
+                    layer.visible = True
+                    self.viewer.layers.append(layer)
                 self.reload_roi_ids_layer()
         else:
             self.reload_roi_ids_layer()
@@ -1502,6 +1545,12 @@ class SimpleTracerWidget(QWidget):
             return
         layer = self.current_roi_layer()
         ids_layer = self.current_roi_ids_layer()
+        mean_layer = (
+            self.enhanced_mean_layer
+            if self.enhanced_mean_layer is not None
+            and self.enhanced_mean_layer in self.viewer.layers
+            else None
+        )
         if layer is None:
             return
         self.save_roi_layer()
@@ -1513,11 +1562,16 @@ class SimpleTracerWidget(QWidget):
                     ids_layer.visible = False
                     self.viewer.layers.remove(ids_layer)
                 self.viewer.layers.remove(layer)
+                if mean_layer is not None:
+                    mean_layer.visible = False
+                    self.viewer.layers.remove(mean_layer)
         finally:
             self.detaching_roi_layers = False
 
     def on_layer_removing(self, event) -> None:
         layer = self.viewer.layers[event.index]
+        if layer is self.enhanced_mean_layer:
+            return
         if self.detaching_roi_layers and (
             layer is self.roi_layer or layer is self.roi_ids_layer
         ):
@@ -1541,7 +1595,11 @@ class SimpleTracerWidget(QWidget):
 
     def on_layer_inserted(self, event) -> None:
         layer = event.value
-        if not isinstance(layer, Image) or self.switching_movie_view:
+        if (
+            not isinstance(layer, Image)
+            or layer is self.enhanced_mean_layer
+            or self.switching_movie_view
+        ):
             return
         self.state_for(layer)
         if self.roi_target_movie is None:
@@ -1553,7 +1611,11 @@ class SimpleTracerWidget(QWidget):
 
     def on_layer_removed(self, event) -> None:
         layer = event.value
-        if not isinstance(layer, Image) or self.switching_movie_view:
+        if (
+            not isinstance(layer, Image)
+            or layer is self.enhanced_mean_layer
+            or self.switching_movie_view
+        ):
             return
         previous_target = self.roi_target_movie
         if layer is self.selected_movie:
@@ -1577,7 +1639,11 @@ class SimpleTracerWidget(QWidget):
         self.set_status(f"ROI mode changed to {mode}.")
 
     def refresh_roi_targets(self) -> None:
-        movies = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        movies = [
+            layer
+            for layer in self.viewer.layers
+            if isinstance(layer, Image) and layer is not self.enhanced_mean_layer
+        ]
         if self.roi_target_movie not in movies:
             self.roi_target_movie = (
                 self.selected_movie
