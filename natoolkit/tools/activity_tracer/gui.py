@@ -1332,7 +1332,7 @@ class SimpleTracerWidget(QWidget):
         self.roi_action_label.setStyleSheet("")
         self.refresh_roi_manager()
 
-    def reload_roi_ids_layer(self, event=None, *, defer_show: bool = False) -> None:
+    def reload_roi_ids_layer(self, event=None) -> None:
         if not self.show_roi_checkbox.isChecked():
             return
         roi_set = self.roi_set_for(create=False)
@@ -1384,7 +1384,7 @@ class SimpleTracerWidget(QWidget):
             if layer.name != name:
                 layer.name = name
         if layer not in self.viewer.layers:
-            layer.visible = not defer_show
+            layer.visible = True
             self.viewer.layers.append(layer)
 
     def save_roi_layer(
@@ -1442,25 +1442,14 @@ class SimpleTracerWidget(QWidget):
                 layer.selected_label = roi_set.active_label
         attach_layer = layer not in self.viewer.layers
         if attach_layer:
-            layer.visible = False
-            self.viewer.layers.append(layer)
-        self.reload_roi_ids_layer(defer_show=attach_layer)
-        if attach_layer:
-            QTimer.singleShot(0, self.show_attached_roi_layers)
-        else:
-            self.activate_roi_layer()
-        self.refresh_roi_manager()
-
-    def show_attached_roi_layers(self) -> None:
-        if not self.show_roi_checkbox.isChecked():
-            return
-        layer = self.current_roi_layer()
-        ids_layer = self.current_roi_ids_layer()
-        if layer is not None:
             layer.visible = True
-        if ids_layer is not None:
-            ids_layer.visible = True
+            with self.viewer.layers.batched_update():
+                self.viewer.layers.append(layer)
+                self.reload_roi_ids_layer()
+        else:
+            self.reload_roi_ids_layer()
         self.activate_roi_layer()
+        self.refresh_roi_manager()
 
     def bind_roi_shortcuts(self, layer: Labels) -> None:
         @layer.bind_key("T")
@@ -1516,14 +1505,14 @@ class SimpleTracerWidget(QWidget):
         if layer is None:
             return
         self.save_roi_layer()
-        layer.visible = False
-        if ids_layer is not None:
-            ids_layer.visible = False
         self.detaching_roi_layers = True
         try:
-            if ids_layer is not None:
-                self.viewer.layers.remove(ids_layer)
-            self.viewer.layers.remove(layer)
+            with self.viewer.layers.batched_update():
+                layer.visible = False
+                if ids_layer is not None:
+                    ids_layer.visible = False
+                    self.viewer.layers.remove(ids_layer)
+                self.viewer.layers.remove(layer)
         finally:
             self.detaching_roi_layers = False
 
