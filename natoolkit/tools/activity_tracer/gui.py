@@ -99,7 +99,7 @@ class SimpleTracerWidget(QWidget):
         self.selected_movie: Image | None = None
         self.roi_mode_name = "Shared"
         self.next_trace_color = 0
-        self.removing_roi_layer = False
+        self.detaching_roi_layers = False
         self.syncing = False
         self.spatial_ref_name: str | None = None
         self.spatial_ref_shape: tuple[int, int] | None = None
@@ -1332,7 +1332,7 @@ class SimpleTracerWidget(QWidget):
         self.roi_action_label.setStyleSheet("")
         self.refresh_roi_manager()
 
-    def reload_roi_ids_layer(self, event=None) -> None:
+    def reload_roi_ids_layer(self, event=None, *, defer_show: bool = False) -> None:
         if not self.show_roi_checkbox.isChecked():
             return
         roi_set = self.roi_set_for(create=False)
@@ -1355,7 +1355,7 @@ class SimpleTracerWidget(QWidget):
             if self.roi_mode_name == "Shared"
             else f"ROI IDs: {self.roi_target_movie.name}"
         )
-        layer = self.current_roi_ids_layer()
+        layer = self.roi_ids_layer
         if layer is None:
             layer = Points(
                 positions,
@@ -1374,12 +1374,18 @@ class SimpleTracerWidget(QWidget):
             )
             layer.editable = False
             self.roi_ids_layer = layer
-            self.viewer.layers.append(layer)
         else:
-            layer.data = positions
-            layer.features = features
-            layer.border_color = colors if ids else "white"
-            layer.name = name
+            current_ids = np.asarray(layer.features.get("roi_id", []), dtype=int)
+            if not np.array_equal(layer.data, positions):
+                layer.data = positions
+            if not np.array_equal(current_ids, features["roi_id"]):
+                layer.features = features
+                layer.border_color = colors if ids else "white"
+            if layer.name != name:
+                layer.name = name
+        if layer not in self.viewer.layers:
+            layer.visible = not defer_show
+            self.viewer.layers.append(layer)
 
     def save_roi_layer(
         self,
@@ -1411,7 +1417,7 @@ class SimpleTracerWidget(QWidget):
         roi_set = self.roi_set_for()
         if roi_set is None:
             return
-        layer = self.current_roi_layer()
+        layer = self.roi_layer
         name = "Shared ROIs" if self.roi_mode_name == "Shared" else f"ROIs: {self.roi_target_movie.name}"
         if layer is None:
             layer = ROILabels(
@@ -1424,17 +1430,37 @@ class SimpleTracerWidget(QWidget):
             layer.preserve_labels = True
             layer.selected_label = roi_set.active_label
             self.roi_layer = layer
-            self.viewer.layers.append(layer)
             self.bind_roi_shortcuts(layer)
             layer.events.selected_label.connect(self.on_roi_label_selected)
             layer.events.show_selected_label.connect(self.reload_roi_ids_layer)
         else:
-            layer.data = roi_set.labels.copy()
-            layer.name = name
-            layer.selected_label = roi_set.active_label
-        self.reload_roi_ids_layer()
-        self.activate_roi_layer()
+            if not np.array_equal(layer.data, roi_set.labels):
+                layer.data = roi_set.labels.copy()
+            if layer.name != name:
+                layer.name = name
+            if layer.selected_label != roi_set.active_label:
+                layer.selected_label = roi_set.active_label
+        attach_layer = layer not in self.viewer.layers
+        if attach_layer:
+            layer.visible = False
+            self.viewer.layers.append(layer)
+        self.reload_roi_ids_layer(defer_show=attach_layer)
+        if attach_layer:
+            QTimer.singleShot(0, self.show_attached_roi_layers)
+        else:
+            self.activate_roi_layer()
         self.refresh_roi_manager()
+
+    def show_attached_roi_layers(self) -> None:
+        if not self.show_roi_checkbox.isChecked():
+            return
+        layer = self.current_roi_layer()
+        ids_layer = self.current_roi_ids_layer()
+        if layer is not None:
+            layer.visible = True
+        if ids_layer is not None:
+            ids_layer.visible = True
+        self.activate_roi_layer()
 
     def bind_roi_shortcuts(self, layer: Labels) -> None:
         @layer.bind_key("T")
@@ -1490,14 +1516,23 @@ class SimpleTracerWidget(QWidget):
         if layer is None:
             return
         self.save_roi_layer()
-        self.removing_roi_layer = True
+        layer.visible = False
         if ids_layer is not None:
-            self.viewer.layers.remove(ids_layer)
-        self.viewer.layers.remove(layer)
-        self.removing_roi_layer = False
+            ids_layer.visible = False
+        self.detaching_roi_layers = True
+        try:
+            if ids_layer is not None:
+                self.viewer.layers.remove(ids_layer)
+            self.viewer.layers.remove(layer)
+        finally:
+            self.detaching_roi_layers = False
 
     def on_layer_removing(self, event) -> None:
         layer = self.viewer.layers[event.index]
+        if self.detaching_roi_layers and (
+            layer is self.roi_layer or layer is self.roi_ids_layer
+        ):
+            return
         if layer is self.roi_ids_layer:
             self.roi_ids_layer = None
             return
@@ -1509,8 +1544,7 @@ class SimpleTracerWidget(QWidget):
             return
         if layer is not self.roi_layer:
             return
-        if not self.removing_roi_layer:
-            self.save_roi_layer(layer=layer)
+        self.save_roi_layer(layer=layer)
         self.roi_layer = None
         self.show_roi_checkbox.blockSignals(True)
         self.show_roi_checkbox.setChecked(False)
