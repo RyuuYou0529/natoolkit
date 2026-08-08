@@ -30,6 +30,11 @@ TOOLS = (
         "Append sleep-state labels to activity traces using movie timestamps.",
         "natoolkit.tools.activity_sleep_state_aligner",
     ),
+    ToolSpec(
+        "AI Guider",
+        "Ask project-scoped questions about usage, algorithms, and implementation.",
+        "natoolkit.ai_guider",
+    ),
 )
 
 
@@ -42,7 +47,7 @@ class LauncherWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Neural Activity Toolkit")
-        self.resize(720, 430)
+        self.resize(720, 520)
 
         title = QtWidgets.QLabel("Neural Activity Toolkit")
         title.setObjectName("title")

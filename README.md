@@ -13,6 +13,7 @@ Qt event loops remain isolated.
 | Activity Tracer | Import imaging movies in napari, manage ROI labels, extract and normalize traces, and detect FRAME-style events. | [Activity Tracer README](natoolkit/tools/activity_tracer/README.md) |
 | Sleep State Staging | Discover EEG/EMG experiments, classify Wake/NREM/REM, review local movie intervals, and commit corrected labels. | [Sleep State Staging README](natoolkit/tools/sleep_state_staging/README.md) |
 | Activity–Sleep State Aligner | Append sleep-state labels to Activity Tracer CSV rows using Note and TIFF timing metadata. | [Aligner README](natoolkit/tools/activity_sleep_state_aligner/README.md) |
+| AI Guider | Answer project-scoped questions from approved documentation and selected source code. | [AI Guider README](natoolkit/ai_guider/README.md) |
 
 ## End-to-End Workflow
 
@@ -55,7 +56,9 @@ pip install -e ".[suite2p]"
 ```
 
 Python 3.10 or newer is required. The default dependencies install napari with
-PyQt6, QtPy, NumPy, SciPy, Matplotlib, PyQtGraph, Dask, and tifffile.
+PyQt6, QtPy, NumPy, SciPy, Matplotlib, PyQtGraph, Dask, tifffile, and the OpenAI
+compatible client used by AI Guider. SOCKS transport support is included for
+environments that route API traffic through a SOCKS proxy.
 
 ## Unified Launcher
 
@@ -84,6 +87,7 @@ Every application remains independently launchable:
 activity-tracer
 sleep-state-staging
 activity-sleep-state-aligner
+ai-guider
 ```
 
 `sleep-state-staging` opens the Qt review GUI. To run the command-line
@@ -93,6 +97,16 @@ classifier, use:
 python -m natoolkit.tools.sleep_state_staging --help
 ```
 
+AI Guider requires a DeepSeek API key in its process environment:
+
+```bash
+export DEEPSEEK_API_KEY="your-token"
+ai-guider
+```
+
+The key is not stored by the application. See the AI Guider README for model,
+scope, source access, and privacy details.
+
 napari can also discover Activity Tracer from the packaged `natoolkit` plugin
 manifest.
 
@@ -101,6 +115,7 @@ manifest.
 ```text
 natoolkit/
   launcher/                         unified Qt launcher
+  ai_guider/                        project-scoped conversational manual
   tools/
     activity_tracer/                napari imaging and ROI workflow
     sleep_state_staging/            EEG/EMG classifier and review GUI

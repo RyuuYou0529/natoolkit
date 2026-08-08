@@ -11,9 +11,11 @@ license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
     "dask[array]",
+    "httpx[socks]>=0.23",
     "matplotlib",
     "napari[pyqt6]",
     "numpy",
+    "openai>=1",
     "pyqtgraph",
     "qtpy",
     "scipy",
@@ -25,6 +27,7 @@ suite2p = ["suite2p>=1.1,<2"]
 
 [project.scripts]
 natoolkit = "natoolkit.launcher.gui:main"
+ai-guider = "natoolkit.ai_guider.gui:main"
 activity-tracer = "natoolkit.tools.activity_tracer.gui:main"
 activity-sleep-state-aligner = "natoolkit.tools.activity_sleep_state_aligner.gui:main"
 sleep-state-staging = "natoolkit.tools.sleep_state_staging.gui:main"
@@ -36,4 +39,4 @@ natoolkit = "natoolkit:napari.yaml"
 include = ["natoolkit*"]
 
 [tool.setuptools.package-data]
-natoolkit = ["napari.yaml", "tools/*/README.md"]
+natoolkit = ["napari.yaml", "ai_guider/README.md", "tools/*/README.md"]
