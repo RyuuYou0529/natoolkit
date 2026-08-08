@@ -24,6 +24,7 @@ dependencies = [
 suite2p = ["suite2p>=1.1,<2"]
 
 [project.scripts]
+natoolkit = "natoolkit.launcher.gui:main"
 activity-tracer = "natoolkit.tools.activity_tracer.gui:main"
 activity-sleep-state-aligner = "natoolkit.tools.activity_sleep_state_aligner.gui:main"
 sleep-state-staging = "natoolkit.tools.sleep_state_staging.gui:main"
@@ -35,4 +36,4 @@ natoolkit = "natoolkit:napari.yaml"
 include = ["natoolkit*"]
 
 [tool.setuptools.package-data]
-natoolkit = ["napari.yaml"]
+natoolkit = ["napari.yaml", "tools/*/README.md"]
