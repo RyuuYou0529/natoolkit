@@ -59,7 +59,7 @@ sleep_state_summary.json
 sleep_state_hypnogram.pdf
 ```
 
-### Correction GUI
+### Review GUI
 
 Launch the minimal review GUI with:
 
@@ -73,9 +73,15 @@ or:
 python -m natoolkit.tools.sleep_state_staging.gui
 ```
 
-The GUI runs the same staging backend, displays EEG, EMG, and Auto/Final
-hypnogram rows, and lets users correct selected epoch intervals. Select an
-interval on the hypnogram, then press `1`, `2`, or `3`:
+Choose an experiment directory in the GUI. The source page detects the top-level
+`Note.txt`, one or more EEG/EMG recordings, and matching raw TIFF movies. It
+supports both a single recording and a Note split into independent sessions such
+as Pre-CNO and Post-CNO. Derived subdirectories are not scanned automatically.
+
+After verifying the detected structure, run automatic analysis. The default
+page is a local video-review workspace with 60 seconds of editable context on
+each side. Click one 1 s label or drag over a time range, then press `1`, `2`, or
+`3`:
 
 ```text
 1 -> Wake
@@ -83,12 +89,25 @@ interval on the hypnogram, then press `1`, `2`, or `3`:
 3 -> REM
 ```
 
+Every track has a synchronized time axis. Use the bottom time-width and
+window-position sliders to zoom and navigate, or `Fit window` to restore the
+full review range. EEG and EMG display gain are controlled independently at
+the right side of their tracks; the mouse wheel does not change the plot scale.
+
+Edits are autosaved as a per-Session draft. Confirming a video updates its
+review status; committing a Session writes stable corrected labels. The global
+overview is read-only and displays committed labels only.
+
 Corrected labels are saved to:
 
 ```text
 sleep_state_corrected_epochs.csv
 sleep_state_corrected_summary.json
+sleep_state_hypnogram.svg
 ```
+
+`Commit Session` regenerates the hypnogram from the latest corrected labels and
+overwrites the previous SVG for that Session.
 
 ### Python API
 
@@ -114,16 +133,17 @@ print(result.summary)
 plot_hypnogram(eeg, emg, result, recording.fs, "hypnogram.pdf")
 ```
 
-`result.labels` contains one label per 1 s step. `result.times_sec` contains the
-center time of each 1 s output label interval. Each label is still inferred from
-a 5 s feature window.
+`result.labels` contains one label per 1 s interval. `result.times_sec` contains
+the center time of each output interval. Each label is inferred from a symmetric
+5 s feature window centered on the label interval. Labels at the recording edges
+are omitted when a complete feature window is unavailable.
 
 ## Core Method
 
 The classifier uses:
 
-- 5 s rolling windows.
-- 1 s step size.
+- Symmetric 5 s rolling feature windows.
+- Fixed 1 s label intervals in the review GUI.
 - EEG downsampled to 100 Hz for spectral features.
 - EMG RMS, EMG P90, coefficient of variation, and 50-150 Hz mid-band power.
 - EEG delta power, theta power, sigma, beta, gamma, total power, spectral
@@ -227,7 +247,9 @@ Before using labels for calcium activity analysis, check:
 - The time convention is consistent: labels are represented by 1 s interval
   centers in `result.times_sec`.
 
-## Current Scope
+## Interface Scope
 
-This package is a library module, not a GUI. A review GUI can be added later,
-but the analysis engine should remain scriptable and reproducible.
+The analysis engine remains scriptable and reproducible. The GUI adds
+experiment discovery, local editable video review, independent read-only global
+inspection, draft recovery, and per-Session commit without changing the Python
+API.

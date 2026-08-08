@@ -30,6 +30,42 @@ class EEGEMGRecording:
         return self.n_samples / self.fs
 
 
+@dataclass(frozen=True)
+class EEGEMGFileInfo:
+    path: Path
+    fs: float
+    n_samples: int | None
+    signal_columns: tuple[int, ...]
+    data_start_row: int
+    encoding: str
+
+    @property
+    def duration_sec(self) -> float | None:
+        if self.n_samples is None:
+            return None
+        return self.n_samples / self.fs
+
+
+def probe_eegemg_txt(
+    path: str | Path,
+    encodings: Iterable[str] = ("gb18030", "utf-8", "latin_1"),
+) -> EEGEMGFileInfo:
+    """Read EEG/EMG layout metadata without loading the signal arrays."""
+    file_path = Path(path)
+    encoding, data_start_row, signal_columns, _delimiter, detected_fs = _detect_layout(
+        file_path, encodings
+    )
+    fs = detected_fs if detected_fs is not None else 1000.0
+    return EEGEMGFileInfo(
+        path=file_path,
+        fs=float(fs),
+        n_samples=_scan_sample_count(file_path, encoding, data_start_row),
+        signal_columns=signal_columns,
+        data_start_row=data_start_row,
+        encoding=encoding,
+    )
+
+
 def load_eegemg_txt(
     path: str | Path,
     eeg_col: int = 1,
@@ -137,3 +173,19 @@ def _parse_sampling_rate(line: str) -> float | None:
     if match is None:
         return None
     return float(match.group(1))
+
+
+def _scan_sample_count(path: Path, encoding: str, stop_row: int) -> int | None:
+    patterns = (
+        re.compile(r"总共\s*([0-9]+)\s*个数据点"),
+        re.compile(r"(?:total|samples?)\D{0,12}([0-9]+)", re.IGNORECASE),
+    )
+    with codecs.open(path, encoding=encoding) as handle:
+        for row_idx, line in enumerate(handle):
+            for pattern in patterns:
+                match = pattern.search(line)
+                if match is not None:
+                    return int(match.group(1))
+            if row_idx >= stop_row:
+                break
+    return None

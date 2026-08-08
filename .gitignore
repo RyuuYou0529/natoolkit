@@ -1,4 +1,4 @@
-test/
+tests/
 
 # Python bytecode and caches
 __pycache__/

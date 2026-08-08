@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 from pathlib import Path
 from typing import Sequence
 
 from .io import load_eegemg_txt
+from .matplotlib_config import configure_matplotlib_cache
 from .preprocess import preprocess_eeg_emg
 from .staging import WAKE_MODES, StagingParams, classify_sleep_state
 
@@ -44,7 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _write_epoch_csv(epochs_path, result.to_records())
     _write_summary(summary_path, recording, result, args)
-    _configure_matplotlib_cache(out_dir)
+    configure_matplotlib_cache()
     from .qc import plot_hypnogram
 
     plot_hypnogram(
@@ -162,12 +162,6 @@ def _write_summary(path: Path, recording, result, args: argparse.Namespace) -> N
     }
     with path.open("w") as handle:
         json.dump(payload, handle, indent=2)
-
-
-def _configure_matplotlib_cache(out_dir: Path) -> None:
-    cache_dir = out_dir / ".matplotlib"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
 
 
 if __name__ == "__main__":

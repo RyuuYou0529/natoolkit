@@ -81,6 +81,8 @@ def classify_sleep_state(
     params = params or StagingParams()
     if params.wake_mode not in WAKE_MODES:
         raise ValueError(f"wake_mode must be one of {WAKE_MODES}, got {params.wake_mode!r}")
+    if params.epoch_sec < params.step_sec:
+        raise ValueError("feature window must be at least as long as the label interval")
 
     eeg = np.asarray(eeg, dtype=np.float64)
     emg = np.asarray(emg, dtype=np.float64)
@@ -155,7 +157,8 @@ def classify_sleep_state(
         "emg_noise_floor": noise_floor,
     }
     times_sec = (
-        np.arange(windows["n_steps"], dtype=np.float64) * params.step_sec
+        (windows["label_start_index"] + np.arange(windows["n_steps"], dtype=np.float64))
+        * params.step_sec
         + params.step_sec / 2.0
     )
     summary = _summary(labels, dynamic_range, mode)
@@ -182,12 +185,25 @@ def _window_sizes(
     step_emg = int(round(params.step_sec * fs_emg))
     if min(win_eeg, win_emg, step_eeg, step_emg) <= 0:
         return {"n_steps": 0}
-    n_steps = min((n_eeg - win_eeg) // step_eeg + 1, (n_emg - win_emg) // step_emg + 1)
+    label_start_index = int(
+        np.ceil(max(0.0, (params.epoch_sec - params.step_sec) / (2.0 * params.step_sec)))
+    )
+    first_center_sec = (label_start_index + 0.5) * params.step_sec
+    first_window_start_sec = first_center_sec - params.epoch_sec / 2.0
+    first_eeg_start = int(round(first_window_start_sec * fs_eeg))
+    first_emg_start = int(round(first_window_start_sec * fs_emg))
+    n_steps = min(
+        (n_eeg - first_eeg_start - win_eeg) // step_eeg + 1,
+        (n_emg - first_emg_start - win_emg) // step_emg + 1,
+    )
     return {
         "win_eeg": win_eeg,
         "win_emg": win_emg,
         "step_eeg": step_eeg,
         "step_emg": step_emg,
+        "first_eeg_start": first_eeg_start,
+        "first_emg_start": first_emg_start,
+        "label_start_index": label_start_index,
         "n_steps": max(int(n_steps), 0),
     }
 
@@ -232,8 +248,8 @@ def _extract_features(
     emg_band = _bandpass_emg(emg, fs_emg, params.emg_low_band[0], params.emg_high_band[1])
 
     for idx in range(n_steps):
-        eeg_start = idx * windows["step_eeg"]
-        emg_start = idx * windows["step_emg"]
+        eeg_start = windows["first_eeg_start"] + idx * windows["step_eeg"]
+        emg_start = windows["first_emg_start"] + idx * windows["step_emg"]
         eeg_epoch = eeg_ds[eeg_start : eeg_start + windows["win_eeg"]]
         emg_epoch = emg[emg_start : emg_start + windows["win_emg"]]
         emg_band_epoch = emg_band[emg_start : emg_start + windows["win_emg"]]

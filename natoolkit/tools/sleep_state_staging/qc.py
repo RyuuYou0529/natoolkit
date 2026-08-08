@@ -4,7 +4,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
-from scipy.signal import spectrogram
+from scipy.signal import resample_poly
 
 from .staging import NREM, REM, WAKE, StagingResult
 
@@ -32,8 +32,8 @@ def plot_hypnogram(
     max_time_bins: int = 3000,
     dpi: int = 150,
 ):
-    eeg = np.asarray(eeg, dtype=np.float64)
-    emg = np.asarray(emg, dtype=np.float64)
+    eeg = np.asarray(eeg, dtype=np.float32)
+    emg = np.asarray(emg, dtype=np.float32)
     n = min(len(eeg), len(emg))
     stop_sec = min(stop_sec if stop_sec is not None else n / fs, n / fs)
     start_sample = max(0, int(round(start_sec * fs)))
@@ -84,12 +84,13 @@ def plot_hypnogram(
     ax_eeg.tick_params(labelbottom=False)
     ax_eeg.set_title(_figure_title(result, title, duration_sec), fontsize=11, fontweight="bold")
 
-    display_clip = max(float(np.percentile(np.abs(emg_seg), 99.5)), 1e-9)
     step = max(1, len(emg_seg) // 30000)
-    emg_t = np.arange(len(emg_seg), dtype=np.float64) / fs
+    emg_display = emg_seg[::step]
+    display_clip = max(float(np.percentile(np.abs(emg_display), 99.5)), 1e-9)
+    emg_t = np.arange(0, len(emg_seg), step, dtype=np.float64) / fs
     ax_emg.plot(
-        emg_t[::step],
-        np.clip(emg_seg, -display_clip, display_clip)[::step],
+        emg_t,
+        np.clip(emg_display, -display_clip, display_clip),
         color="black",
         lw=0.35,
         rasterized=True,
@@ -114,18 +115,28 @@ def plot_hypnogram(
 
 
 def _spectrogram(eeg: np.ndarray, fs: float, max_time_bins: int):
-    nperseg = min(len(eeg), int(round(5 * fs)))
-    noverlap = min(max(0, nperseg - int(round(fs))), nperseg - 1)
-    nfft = max(4096, nperseg)
-    freqs, times, power = spectrogram(eeg, fs=fs, nperseg=nperseg, noverlap=noverlap, nfft=nfft)
-    freq_mask = (freqs >= 0.0) & (freqs <= 30.0)
-    power_db = 10 * np.log10(power[freq_mask, :] + 1e-15)
+    target_fs = min(float(fs), 100.0)
+    down = max(1, int(round(fs / target_fs)))
+    signal = resample_poly(np.asarray(eeg, dtype=np.float32), 1, down)
+    actual_fs = fs / down
+    window = min(len(signal), max(8, int(round(5.0 * actual_fs))))
+    if len(signal) < window or window < 8:
+        return np.asarray([]), np.asarray([]), np.empty((0, 0)), 0.0, 1.0
+    possible = max(1, int((len(signal) - window) / actual_fs) + 1)
+    count = possible if max_time_bins <= 0 else min(max_time_bins, possible)
+    starts = np.linspace(0, len(signal) - window, count, dtype=np.int64)
+    indices = starts[:, None] + np.arange(window, dtype=np.int64)[None, :]
+    segments = signal[indices]
+    segments = segments - np.mean(segments, axis=1, keepdims=True)
+    segments *= np.hanning(window).astype(np.float32)
+    nfft = max(512, 1 << int(np.ceil(np.log2(window))))
+    power = np.abs(np.fft.rfft(segments, n=nfft, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / actual_fs)
+    freq_mask = freqs <= 30.0
+    power_db = 10 * np.log10(power[:, freq_mask].T + 1e-15)
+    times = (starts + window / 2.0) / actual_fs
     vmin = float(np.percentile(power_db, 5))
     vmax = vmin + 30.0
-    if max_time_bins > 0 and power_db.shape[1] > max_time_bins:
-        keep = np.linspace(0, power_db.shape[1] - 1, max_time_bins).astype(np.int64)
-        times = times[keep]
-        power_db = power_db[:, keep]
     power_db = np.clip(power_db, vmin, vmax)
     return freqs[freq_mask], times, power_db, vmin, vmax
 
